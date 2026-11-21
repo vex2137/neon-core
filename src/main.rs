@@ -1802,7 +1802,7 @@ impl Game {
             };
             if elite {
                 shard = (shard * 3).max(3);
-                xp = (xp * 2.4).round();
+                xp = (xp * 2.4_f32).round();
             }
             self.spawn_gem(epos, xp, shard);
         } else {
