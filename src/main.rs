@@ -1,4 +1,16 @@
+#[cfg(not(target_arch = "wasm32"))]
 use macroquad::audio::{load_sound_from_bytes, play_sound, PlaySoundParams, Sound};
+
+#[cfg(target_arch = "wasm32")]
+mod wasm_audio {
+    pub struct Sound;
+    #[derive(Default)]
+    pub struct PlaySoundParams { pub looped: bool, pub volume: f32 }
+    pub async fn load_sound_from_bytes(_data: &[u8]) -> Result<Sound, ()> { Err(()) }
+    pub fn play_sound(_sound: &Sound, _params: PlaySoundParams) {}
+}
+#[cfg(target_arch = "wasm32")]
+use wasm_audio::{load_sound_from_bytes, play_sound, PlaySoundParams, Sound};
 use macroquad::prelude::*;
 
 const ARENA_RADIUS: f32 = 2800.0;
