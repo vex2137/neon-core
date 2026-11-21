@@ -41,4 +41,4 @@ build_targets = ["aarch64-linux-android"]
 [package.metadata.android.activity_attributes]
 "android:exported" = "true"
 "android:screenOrientation" = "sensorLandscape"
-"android:theme" = "@style/NeonCoreFullscreen"
+"android:theme" = "@android:style/Theme.NoTitleBar.Fullscreen"
