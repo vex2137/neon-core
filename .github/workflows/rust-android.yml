@@ -1,12 +1,61 @@
-name: Build Native Android APK & WASM Demo
+name: CI, Validation & Cross-Platform Release Builds
 
 on:
   push:
+    branches: [ main, "refactor/**" ]
+  pull_request:
     branches: [ main ]
   workflow_dispatch:
 
 jobs:
+  validate:
+    name: Format, Clippy, Check & Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Linux desktop system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libx11-dev libxi-dev libgl1-mesa-dev
+
+      - name: Install Rust toolchain (rustfmt, clippy, wasm32)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo registry and build artifacts
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-validate-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-validate-
+
+      - name: Verify formatting (cargo fmt --check)
+        run: cargo fmt --all -- --check
+
+      - name: Check native target
+        run: cargo check --all-targets
+
+      - name: Check WebAssembly demo target
+        run: cargo check --target wasm32-unknown-unknown --features demo
+
+      - name: Run Clippy lints
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run unit, regression & simulation tests
+        run: cargo test -- --nocapture
+
   build-android:
+    name: Build Native Android APK (ARM64, SDK 35)
+    needs: validate
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -18,10 +67,10 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Install Rust & Android/WASM Targets
+      - name: Install Rust & Android ARM64 Target
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android,wasm32-unknown-unknown
+          targets: aarch64-linux-android
 
       - name: Install Android SDK Platform 35, Build-Tools 35.0.0 & NDK r25
         run: |
@@ -41,6 +90,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pkg-config libssl-dev
           cargo install --git https://github.com/not-fl3/cargo-quad-apk --rev d411c8f --locked
+
+      - name: Cache Cargo registry and Android target
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/aarch64-linux-android/
+          key: ${{ runner.os }}-cargo-android-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-android-
 
       - name: Build Native Android APK (Release)
         run: |
@@ -87,7 +148,32 @@ jobs:
           path: target/android-artifacts/release/apk/neon_core.apk
           if-no-files-found: error
 
-      - name: Build WASM Web Demo (itch.io)
+  build-wasm:
+    name: Build WebAssembly Demo (wasm32)
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust & WASM Target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo registry and WASM target
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/wasm32-unknown-unknown/
+          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-wasm-
+
+      - name: Build WASM Web Demo (Release)
         run: |
           set -euo pipefail
           cargo build --release --target wasm32-unknown-unknown --features demo
@@ -117,4 +203,45 @@ jobs:
         with:
           name: neon-core-rust-wasm-demo
           path: neon-core-rust-wasm-demo.zip
+          if-no-files-found: error
+
+  build-desktop:
+    name: Build Native Desktop Binary (Linux x86_64)
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Linux desktop system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libx11-dev libxi-dev libgl1-mesa-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and desktop release target
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/release/
+          key: ${{ runner.os }}-cargo-desktop-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-desktop-
+
+      - name: Build Native Desktop Release
+        run: |
+          set -euo pipefail
+          cargo build --release
+          test -x target/release/neon_core
+
+      - name: Upload Native Desktop Binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: neon-core-linux-x86_64
+          path: target/release/neon_core
           if-no-files-found: error
