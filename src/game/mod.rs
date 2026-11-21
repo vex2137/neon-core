@@ -19,9 +19,9 @@ use crate::effects::{EffectsPool, TextBuf};
 use crate::enemies::{
     compute_spawn_position, create_enemy, roll_wave_enemy_kind, update_enemies_ai, Enemy, EnemyKind,
 };
-use crate::input::{FrameInput, TouchState};
+use crate::input::{FrameInput, GamepadManager, TouchState};
 use crate::performance::PerfMetrics;
-use crate::persistence::MetaSave;
+use crate::persistence::{MetaSave, RunSnapshot, RunSummary};
 use crate::player::{
     ship_by_id, try_trigger_dash, update_aim, update_player_movement, update_primary_weapon,
     PlayerState, ShipSpec,
@@ -39,6 +39,15 @@ use macroquad::color::{Color, WHITE};
 use macroquad::math::{vec2, Vec2};
 use std::fmt::Write;
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UiFocusState {
+    pub menu_idx: usize,
+    pub pause_idx: usize,
+    pub settings_idx: usize,
+    pub levelup_idx: usize,
+    pub gamepad_nav_active: bool,
+}
+
 pub struct Game {
     pub state: ScreenState,
     pub prev_state: ScreenState,
@@ -46,6 +55,7 @@ pub struct Game {
     pub settings: Settings,
     pub meta: MetaSave,
     pub persist_saves: bool,
+    pub saved_run_summary: Option<RunSummary>,
     pub sounds: SoundBank,
     pub rng: GameRng,
     pub metrics: PerfMetrics,
@@ -83,6 +93,8 @@ pub struct Game {
     pub pickup_popup_timer: f32,
 
     pub touch: TouchState,
+    pub gamepad: GamepadManager,
+    pub ui_focus: UiFocusState,
     pub level_choices: [UpgradeCard; 3],
 }
 
@@ -90,25 +102,46 @@ impl Game {
     pub fn new(sounds: SoundBank) -> Self {
         let mut rng = GameRng::from_entropy();
         let meta = MetaSave::load();
-        Self::build(sounds, meta, true, &mut rng)
+        Self::build(sounds, meta, true, GamepadManager::new(), &mut rng)
     }
 
     /// Deterministic constructor for headless unit/regression tests and benchmarks (never touches disk).
     #[cfg(test)]
     pub fn new_headless(seed: u64, meta: MetaSave) -> Self {
         let mut rng = GameRng::seeded(seed);
-        Self::build(SoundBank::empty(), meta.validated(), false, &mut rng)
+        Self::build(
+            SoundBank::empty(),
+            meta.validated(),
+            false,
+            GamepadManager::headless(),
+            &mut rng,
+        )
     }
 
-    fn build(sounds: SoundBank, meta: MetaSave, persist_saves: bool, rng: &mut GameRng) -> Self {
+    fn build(
+        sounds: SoundBank,
+        meta: MetaSave,
+        persist_saves: bool,
+        gamepad: GamepadManager,
+        rng: &mut GameRng,
+    ) -> Self {
         let stars = generate_starfield(rng, 160);
+        let settings = meta.settings.validated();
+        let mut effects = EffectsPool::new();
+        effects.set_particle_cap(settings.particle_cap());
+        let saved_run_summary = if persist_saves {
+            RunSnapshot::load_summary_default()
+        } else {
+            None
+        };
         Self {
             state: ScreenState::Menu,
             prev_state: ScreenState::Menu,
             shop_tab: 0,
-            settings: Settings::default(),
+            settings,
             meta,
             persist_saves,
+            saved_run_summary,
             sounds,
             rng: *rng,
             metrics: PerfMetrics::new(),
@@ -122,7 +155,7 @@ impl Game {
             grid: SpatialGrid::with_capacity(MAX_ENEMIES),
             gems: Vec::with_capacity(MAX_GEMS),
             stars,
-            effects: EffectsPool::new(),
+            effects,
 
             player: PlayerState::default(),
             xp: 0.0,
@@ -146,6 +179,8 @@ impl Game {
             pickup_popup_timer: 0.0,
 
             touch: TouchState::default(),
+            gamepad,
+            ui_focus: UiFocusState::default(),
             level_choices: [ALL_UPGRADES[0], ALL_UPGRADES[1], ALL_UPGRADES[2]],
         }
     }
@@ -198,21 +233,30 @@ impl Game {
             return;
         }
 
+        let sfx_gain = self.settings.effective_sfx_gain();
+        let shake_scale = self.settings.shake_scale();
+        self.effects.set_particle_cap(self.settings.particle_cap());
+
         if input.pause_pressed {
             self.pause_run();
             return;
         }
         if input.dash_pressed {
+            let dash_was_ready = self.player.dash_cd <= 0.0;
             if let Some((pos, dmg, rad)) = try_trigger_dash(
                 &mut self.player,
                 input.move_dir,
                 self.meta.selected_ship,
                 &self.sounds,
                 &mut self.effects,
-                self.settings.sound,
-                self.settings.shake,
+                sfx_gain,
+                shake_scale,
             ) {
                 self.spawn_mine(pos, dmg, rad);
+            }
+            if dash_was_ready {
+                self.gamepad
+                    .trigger_rumble(0.28, 70, self.settings.vibration);
             }
         }
 
@@ -312,8 +356,10 @@ impl Game {
             &mut self.player,
             &mut self.bullets,
             &mut self.sounds,
-            self.settings.sound,
+            sfx_gain,
             self.settings.auto_aim,
+            self.settings.auto_fire,
+            input.fire_held,
             input.manual_aim_dir.is_some(),
             nearest_pos.is_some(),
             self.meta.overdrive_lvl,
@@ -429,7 +475,7 @@ impl Game {
             &mut self.e_bullets,
             &mut self.effects,
             &self.sounds,
-            self.settings.sound,
+            sfx_gain,
             self.player.pos,
             self.player.dash_timer > 0.0,
             self.wave,
@@ -470,7 +516,7 @@ impl Game {
             dt,
             &mut self.effects,
             &self.sounds,
-            self.settings.sound,
+            sfx_gain,
             &mut self.rng,
         );
         if hz_hits.damage > 0.0 && self.damage_player(hz_hits.damage, hz_hits.shake) {
@@ -496,8 +542,7 @@ impl Game {
                 self.xp -= self.next_xp;
                 self.level = self.level.saturating_add(1);
                 self.next_xp = next_level_xp(self.next_xp);
-                self.sounds
-                    .play(&self.sounds.lvlup, self.settings.sound, 0.8);
+                self.sounds.play(&self.sounds.lvlup, sfx_gain, 0.8);
                 self.effects.spawn_ring(
                     self.player.pos,
                     150.0,
@@ -664,9 +709,10 @@ impl Game {
             let erad = self.enemies[idx].radius;
             let e_angle = self.enemies[idx].angle;
 
+            let sfx_gain = self.settings.effective_sfx_gain();
             self.sounds.play(
                 &self.sounds.boom,
-                self.settings.sound,
+                sfx_gain,
                 if kind == EnemyKind::Boss {
                     1.0
                 } else if elite {
@@ -683,12 +729,16 @@ impl Game {
                 } else {
                     3.5
                 },
-                self.settings.shake,
+                self.settings.shake_scale(),
             );
             if kind == EnemyKind::Boss {
-                self.effects.add_hit_stop(0.055);
+                self.effects.add_hit_stop(0.055, self.settings.hit_stop);
+                self.gamepad
+                    .trigger_rumble(0.85, 180, self.settings.vibration);
             } else if elite {
-                self.effects.add_hit_stop(0.024);
+                self.effects.add_hit_stop(0.024, self.settings.hit_stop);
+                self.gamepad
+                    .trigger_rumble(0.45, 95, self.settings.vibration);
             }
 
             let col = kind.base_color(false);
@@ -747,7 +797,7 @@ impl Game {
             self.spawn_gem(epos, reward.xp, reward.shard);
         } else {
             self.sounds
-                .play(&self.sounds.hit, self.settings.sound, 0.35);
+                .play(&self.sounds.hit, self.settings.effective_sfx_gain(), 0.35);
             self.effects.spawn_particle(
                 hit_pos,
                 vec2(
@@ -771,16 +821,20 @@ impl Game {
                 0.18,
             );
         }
+        let shake_scale = self.settings.shake_scale();
         if out.hp_lost <= 0.0 {
             if out.shield_absorbed > 0.0 {
-                self.effects
-                    .add_shake(shake_amt * 0.45, self.settings.shake);
+                self.effects.add_shake(shake_amt * 0.45, shake_scale);
+                self.gamepad
+                    .trigger_rumble(0.25, 65, self.settings.vibration);
             }
             return false;
         }
 
         self.effects.hurt_flash = (self.effects.hurt_flash + 0.45).min(1.0);
-        self.effects.add_shake(shake_amt, self.settings.shake);
+        self.effects.add_shake(shake_amt, shake_scale);
+        self.gamepad
+            .trigger_rumble(0.65, 130, self.settings.vibration);
         if out.lethal {
             self.finish_run(false);
             return true;
@@ -821,7 +875,7 @@ impl Game {
         let purple = Color::from_rgba(184, 41, 234, 255);
         self.effects.spawn_ring(m.pos, m.radius, purple, 0.34);
         self.sounds
-            .play(&self.sounds.boom, self.settings.sound, 0.7);
+            .play(&self.sounds.boom, self.settings.effective_sfx_gain(), 0.7);
         for _ in 0..12 {
             let a = self.rng.range_f32(0.0, std::f32::consts::TAU);
             let spd = self.rng.range_f32(80.0, 260.0);

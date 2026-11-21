@@ -73,7 +73,7 @@ pub fn update_hazards(
     dt: f32,
     effects: &mut EffectsPool,
     sounds: &SoundBank,
-    sound_enabled: bool,
+    sfx_gain: f32,
     rng: &mut GameRng,
 ) -> IncomingPlayerHits {
     let mut hits = IncomingPlayerHits::default();
@@ -85,7 +85,7 @@ pub fn update_hazards(
             let h = hazards.swap_remove(hi);
             let crimson = Color::from_rgba(255, 58, 92, 255);
             effects.spawn_ring(h.pos, h.radius * 1.15, crimson, 0.34);
-            sounds.play(&sounds.boom, sound_enabled, 0.55);
+            sounds.play(&sounds.boom, sfx_gain, 0.55);
             for _ in 0..10 {
                 let a = rng.range_f32(0.0, std::f32::consts::TAU);
                 let spd = rng.range_f32(60.0, 210.0);

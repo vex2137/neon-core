@@ -46,7 +46,7 @@ pub fn update_enemies_ai(
     e_bullets: &mut Vec<EnemyBullet>,
     effects: &mut EffectsPool,
     sounds: &SoundBank,
-    sound_enabled: bool,
+    sfx_gain: f32,
     player_pos: Vec2,
     player_dashing: bool,
     wave: u32,
@@ -137,7 +137,7 @@ pub fn update_enemies_ai(
                             5.0,
                         );
                     }
-                    sounds.play(&sounds.shoot, sound_enabled, 0.35);
+                    sounds.play(&sounds.shoot, sfx_gain, 0.35);
                 }
             }
             EnemyKind::Bomber => {
@@ -146,7 +146,7 @@ pub fn update_enemies_ai(
                     enemy.alive = false;
                     outcome.any_died = true;
                     effects.spawn_ring(epos, 115.0, Color::from_rgba(170, 255, 45, 255), 0.32);
-                    sounds.play(&sounds.boom, sound_enabled, 0.75);
+                    sounds.play(&sounds.boom, sfx_gain, 0.75);
                     let pellets = if elite { 10 } else { 7 };
                     let b_spd = 250.0 + (wave as f32 * 8.0).min(120.0);
                     let b_dmg = 13.0 * e_dmg_scale;

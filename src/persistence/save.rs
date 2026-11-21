@@ -2,6 +2,7 @@
 
 #[cfg(any(not(target_arch = "wasm32"), test))]
 use super::migration::{parse_save, serialize_v2, SaveFormat};
+use crate::game::state::Settings;
 #[cfg(any(not(target_arch = "wasm32"), test))]
 use crate::player::SHIPS;
 use crate::progression::max_level_for_id;
@@ -33,6 +34,7 @@ pub struct MetaSave {
     pub difficulty: u32,
     pub best_wave: u32,
     pub best_kills: u32,
+    pub settings: Settings,
 }
 
 impl Default for MetaSave {
@@ -59,6 +61,7 @@ impl Default for MetaSave {
             difficulty: 0,
             best_wave: 0,
             best_kills: 0,
+            settings: Settings::default(),
         }
     }
 }
@@ -91,6 +94,7 @@ impl MetaSave {
             self.selected_ship = 0;
         }
         self.difficulty = self.difficulty.min((DIFFICULTIES.len() - 1) as u32);
+        self.settings = self.settings.validated();
         self
     }
 

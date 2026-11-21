@@ -488,4 +488,27 @@ pub fn render_hud(game: &Game, vp: Viewport) {
         );
         draw_circle(cur.x, cur.y, 20.0 * s, Color::from_rgba(255, 42, 109, 220));
     }
+
+    // Optional zero-alloc live performance diagnostics strip
+    if game.settings.perf_hud {
+        let snap = game.metrics.snapshot();
+        let fps = if snap.avg_ms > 0.01 {
+            1000.0 / snap.avg_ms
+        } else {
+            0.0
+        };
+        let mut perf_buf = TextBuf::<80>::new();
+        let _ = write!(
+            &mut perf_buf,
+            "{:.0} FPS | {:.1}ms (pk {:.1}) | E:{} B:{} P:{}",
+            fps,
+            snap.avg_ms,
+            snap.max_ms,
+            snap.enemies,
+            snap.bullets + snap.e_bullets,
+            snap.particles
+        );
+        let py = (vp.vh - 14.0) * s;
+        draw_centered_text(perf_buf.as_str(), vp.vw * 0.5 * s, py, 12.5 * s, GOLD);
+    }
 }

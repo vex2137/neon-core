@@ -39,8 +39,10 @@ pub fn update_primary_weapon(
     player: &mut PlayerState,
     bullets: &mut Vec<Bullet>,
     sounds: &mut SoundBank,
-    sound_enabled: bool,
+    sfx_gain: f32,
     auto_aim: bool,
+    auto_fire: bool,
+    fire_held: bool,
     manual_aim: bool,
     has_target: bool,
     overdrive_lvl: u32,
@@ -48,7 +50,12 @@ pub fn update_primary_weapon(
 ) {
     sounds.tick_cooldowns(dt);
     player.fire_cd -= dt;
-    if player.fire_cd > 0.0 || !(manual_aim || !auto_aim || has_target) {
+    let should_fire = if auto_fire {
+        manual_aim || !auto_aim || has_target || fire_held
+    } else {
+        fire_held
+    };
+    if player.fire_cd > 0.0 || !should_fire {
         return;
     }
 
@@ -57,7 +64,7 @@ pub fn update_primary_weapon(
     } else {
         player.fire_interval
     };
-    sounds.play_shoot_throttled(sound_enabled);
+    sounds.play_shoot_throttled(sfx_gain);
 
     let spread = player.bullet_spread;
     let shot_dmg = if player.overdrive_timer > 0.0 {

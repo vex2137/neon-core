@@ -19,7 +19,7 @@ jobs:
       - name: Install Linux desktop system libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libx11-dev libxi-dev libgl1-mesa-dev
+          sudo apt-get install -y libasound2-dev libx11-dev libxi-dev libgl1-mesa-dev libudev-dev pkg-config
 
       - name: Install Rust toolchain (rustfmt, clippy, wasm32)
         uses: dtolnay/rust-toolchain@stable
@@ -217,7 +217,7 @@ jobs:
       - name: Install Linux desktop system libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libx11-dev libxi-dev libgl1-mesa-dev
+          sudo apt-get install -y libasound2-dev libx11-dev libxi-dev libgl1-mesa-dev libudev-dev pkg-config
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

@@ -75,6 +75,32 @@ pub enum WaveEvent {
 }
 
 impl WaveEvent {
+    #[cfg(any(not(target_arch = "wasm32"), test))]
+    #[inline]
+    pub fn as_u8(self) -> u8 {
+        match self {
+            WaveEvent::Normal => 0,
+            WaveEvent::Swarm => 1,
+            WaveEvent::Orbital => 2,
+            WaveEvent::Sniper => 3,
+            WaveEvent::Bomber => 4,
+            WaveEvent::Boss => 5,
+        }
+    }
+
+    #[cfg(any(not(target_arch = "wasm32"), test))]
+    #[inline]
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => WaveEvent::Swarm,
+            2 => WaveEvent::Orbital,
+            3 => WaveEvent::Sniper,
+            4 => WaveEvent::Bomber,
+            5 => WaveEvent::Boss,
+            _ => WaveEvent::Normal,
+        }
+    }
+
     #[inline]
     pub fn tag(self) -> &'static str {
         match self {

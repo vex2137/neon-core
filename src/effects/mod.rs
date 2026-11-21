@@ -15,6 +15,7 @@ pub struct EffectsPool {
     pub rings: Vec<Ring>,
     pub texts: Vec<DmgText>,
     pub arcs: Vec<ArcBolt>,
+    pub max_particles: usize,
     pub shake: f32,
     pub hit_stop: f32,
     pub hurt_flash: f32,
@@ -27,9 +28,17 @@ impl EffectsPool {
             rings: Vec::with_capacity(MAX_RINGS),
             texts: Vec::with_capacity(MAX_TEXTS),
             arcs: Vec::with_capacity(MAX_ARCS),
+            max_particles: MAX_PARTICLES,
             shake: 0.0,
             hit_stop: 0.0,
             hurt_flash: 0.0,
+        }
+    }
+
+    pub fn set_particle_cap(&mut self, cap: usize) {
+        self.max_particles = cap.clamp(32, MAX_PARTICLES);
+        if self.particles.len() > self.max_particles {
+            self.particles.truncate(self.max_particles);
         }
     }
 
@@ -44,7 +53,7 @@ impl EffectsPool {
     }
 
     pub fn spawn_particle(&mut self, pos: Vec2, vel: Vec2, life: f32, size: f32, color: Color) {
-        if self.particles.len() >= MAX_PARTICLES {
+        if self.particles.len() >= self.max_particles {
             return;
         }
         self.particles.push(Particle {
@@ -90,14 +99,16 @@ impl EffectsPool {
         self.arcs.push(ArcBolt { a, b, life: 0.14 });
     }
 
-    pub fn add_shake(&mut self, amount: f32, enabled: bool) {
-        if enabled && amount.is_finite() {
-            self.shake = self.shake.max(amount);
+    /// Applies camera shake scaled by `shake_scale` (`0.0`, `0.5`, or `1.0`).
+    pub fn add_shake(&mut self, amount: f32, shake_scale: f32) {
+        if shake_scale > 0.0 && amount.is_finite() && shake_scale.is_finite() {
+            self.shake = self.shake.max(amount * shake_scale.clamp(0.0, 1.0));
         }
     }
 
-    pub fn add_hit_stop(&mut self, duration: f32) {
-        if duration.is_finite() {
+    /// Schedules impact freeze-frame when `enabled` is true.
+    pub fn add_hit_stop(&mut self, duration: f32, enabled: bool) {
+        if enabled && duration.is_finite() && duration > 0.0 {
             self.hit_stop = self.hit_stop.max(duration);
         }
     }

@@ -16,7 +16,7 @@ pub enum EnemyKind {
 }
 
 impl EnemyKind {
-    #[cfg(test)]
+    #[cfg(any(not(target_arch = "wasm32"), test))]
     #[inline]
     pub fn from_u8(v: u8) -> Self {
         match v {

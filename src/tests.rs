@@ -19,6 +19,7 @@ fn full_simulation_is_deterministic_for_identical_seeds_and_inputs() {
     let input = FrameInput {
         move_dir: vec2(0.8, -0.6).normalize(),
         manual_aim_dir: None,
+        fire_held: false,
         dash_pressed: false,
         pause_pressed: false,
     };
@@ -310,4 +311,392 @@ fn benchmark_textbuf_vs_heap_string_and_spatial_grid_vs_linear() {
         lin_us / grid_us.max(1.0),
         grid_hits
     );
+}
+
+#[test]
+fn mid_run_save_and_resume_preserves_full_state_and_determinism() {
+    use crate::persistence::run_save::{delete_run_save_at, RunSnapshot};
+    use crate::world::hazards::spawn_hazard;
+
+    let vp = Viewport::from_dimensions(2400.0, 1080.0);
+    let meta = MetaSave {
+        selected_ship: 3, // Phantom Wraith
+        unlocked_ships_mask: 0b1111,
+        difficulty: 1, // Hardcore
+        shield_lvl: 3,
+        ..MetaSave::default()
+    };
+    let mut original = Game::new_headless(424242, meta);
+    original.start_run(vp);
+    original.wave = 4;
+    original.wave_timer = 11.5;
+    original.level = 5;
+    original.xp = 42.25;
+    original.next_xp = 110.0;
+    original.combo = 9;
+    original.combo_timer = 2.4;
+    original.run_shards = 135;
+    original.kills = 47;
+    original.player.pos = vec2(220.0, -145.0);
+    original.player.vel = vec2(60.0, -30.0);
+    original.player.hp = 82.0;
+    original.player.shield = 44.0;
+    original.player.apply_upgrade(4); // Orbital Saws
+    original.player.apply_upgrade(5); // Chain Tesla
+    original.player.apply_upgrade(6); // EMP Nova
+    original.spawn_mine(vec2(180.0, -100.0), 90.0, 138.0);
+    spawn_hazard(&mut original.hazards, vec2(260.0, -90.0), 70.0, 1.1, 30.0);
+    original
+        .beacon
+        .spawn_near(original.player.pos, &mut original.rng);
+    original.spawn_enemy_at(EnemyKind::Boss, vec2(450.0, -140.0), false);
+
+    let dir = std::env::temp_dir().join(format!("neon_core_run_rt_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("neon_core_run.dat");
+
+    let snap = original.capture_run_snapshot();
+    snap.save_to_path(&path).expect("save mid-run snapshot");
+
+    let loaded = RunSnapshot::load_from_path(&path).expect("load mid-run snapshot");
+    let mut resumed = Game::new_headless(1, MetaSave::default());
+    resumed.restore_run_snapshot(loaded);
+
+    assert_eq!(resumed.meta.selected_ship, 3);
+    assert_eq!(resumed.meta.difficulty, 1);
+    assert_eq!(resumed.wave, 4);
+    assert_eq!(resumed.level, 5);
+    assert_eq!(resumed.run_shards, 135);
+    assert_eq!(resumed.kills, 47);
+    assert_eq!(resumed.player.orbit_count, original.player.orbit_count);
+    assert_eq!(resumed.player.tesla_lvl, original.player.tesla_lvl);
+    assert_eq!(resumed.player.nova_lvl, original.player.nova_lvl);
+    assert_eq!(resumed.mines.len(), original.mines.len());
+    assert_eq!(resumed.hazards.len(), original.hazards.len());
+    assert_eq!(resumed.beacon.active, original.beacon.active);
+    assert_eq!(resumed.enemies.len(), original.enemies.len());
+    assert_eq!(resumed.rng.state(), original.rng.state());
+
+    // Step both simulations forward identically — RNG and physics must stay synchronized.
+    let frame_in = FrameInput {
+        move_dir: vec2(1.0, 0.25).normalize(),
+        ..FrameInput::default()
+    };
+    for _ in 0..30 {
+        original.step_playing(1.0 / 60.0, frame_in, vp);
+        resumed.step_playing(1.0 / 60.0, frame_in, vp);
+    }
+    assert!((original.player.pos - resumed.player.pos).length() < 1e-3);
+    assert_eq!(original.kills, resumed.kills);
+    assert_eq!(original.rng.state(), resumed.rng.state());
+
+    delete_run_save_at(&path);
+    assert!(!path.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn mid_run_save_corruption_recovers_from_backup_and_death_clears_save() {
+    use crate::persistence::run_save::{
+        delete_run_save_at, parse_run_v1, serialize_run_v1, RunParseError, RunSnapshot,
+    };
+
+    let vp = Viewport::from_dimensions(1280.0, 720.0);
+    let mut game = Game::new_headless(9001, MetaSave::default());
+    game.start_run(vp);
+    game.wave = 3;
+    game.kills = 25;
+
+    let dir = std::env::temp_dir().join(format!("neon_core_run_bak_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("neon_core_run.dat");
+
+    let snap1 = game.capture_run_snapshot();
+    snap1.save_to_path(&path).expect("first run save");
+
+    game.wave = 5;
+    game.kills = 60;
+    let snap2 = game.capture_run_snapshot();
+    snap2
+        .save_to_path(&path)
+        .expect("second run save creates .bak");
+
+    // Tampered checksum must be rejected directly by parser.
+    let tampered = serialize_run_v1(&snap2).replace("wave=5", "wave=99");
+    assert_eq!(
+        parse_run_v1(&tampered).unwrap_err(),
+        RunParseError::CorruptChecksum
+    );
+
+    // Corrupt primary on disk -> loader quarantines `.corrupt` and recovers `.bak` (wave 3).
+    std::fs::write(&path, tampered).expect("write tampered primary");
+    let recovered = RunSnapshot::load_from_path(&path).expect("recover from .bak");
+    assert_eq!(recovered.wave, 3);
+    assert_eq!(recovered.kills, 25);
+    assert!(dir.join("neon_core_run.dat.corrupt").exists());
+
+    // Delete on run completion clears both primary and backup files.
+    delete_run_save_at(&path);
+    assert!(!path.exists());
+    assert!(!dir.join("neon_core_run.dat.bak").exists());
+
+    // In-game finish_run clears cached summary to prevent save-scumming.
+    game.save_active_run();
+    assert!(game.saved_run_summary.is_some());
+    game.finish_run(false);
+    assert!(game.saved_run_summary.is_none());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn expanded_settings_persist_in_v2_and_older_v2_saves_keep_defaults() {
+    use crate::game::Settings;
+    use crate::persistence::migration::{parse_save, serialize_v2, SAVE_HEADER_V2};
+
+    let custom = Settings {
+        sound: true,
+        master_volume: 70,
+        sfx_volume: 60,
+        shake_intensity: 50,
+        hit_stop: false,
+        dmg_nums: false,
+        high_particles: false,
+        fixed_stick: true,
+        auto_aim: false,
+        auto_fire: false,
+        stick_deadzone: 25,
+        vibration: false,
+        perf_hud: true,
+    };
+    let meta = MetaSave {
+        shards: 5555,
+        dmg_lvl: 7,
+        settings: custom,
+        ..MetaSave::default()
+    };
+    let encoded = serialize_v2(&meta);
+    let (decoded, _) = parse_save(&encoded).expect("v2 with settings parses");
+    assert_eq!(decoded.settings, custom);
+    assert!((decoded.settings.effective_sfx_gain() - 0.42).abs() < 1e-4);
+    assert!((decoded.settings.shake_scale() - 0.5).abs() < 1e-4);
+
+    // Older v2 save without any `set_*` keys must preserve progression and apply default settings.
+    let legacy_v2 = format!("{SAVE_HEADER_V2}\nshards=888\ndmg_lvl=4\nbest_wave=14\n");
+    let (loaded, _) = parse_save(&legacy_v2).expect("older v2 without settings parses");
+    assert_eq!(loaded.shards, 888);
+    assert_eq!(loaded.dmg_lvl, 4);
+    assert_eq!(loaded.best_wave, 14);
+    assert_eq!(loaded.settings, Settings::default());
+}
+
+#[test]
+fn settings_affect_auto_fire_shake_hit_stop_and_particle_density() {
+    use crate::game::Settings;
+
+    let vp = Viewport::from_dimensions(1280.0, 720.0);
+    let meta = MetaSave {
+        settings: Settings {
+            auto_fire: false,
+            shake_intensity: 50,
+            hit_stop: false,
+            high_particles: false,
+            ..Settings::default()
+        },
+        ..MetaSave::default()
+    };
+    let mut game = Game::new_headless(707, meta);
+    game.start_run(vp);
+    game.enemies.clear();
+    game.spawn_enemy_at(EnemyKind::Tank, vec2(120.0, 0.0), false);
+
+    // With Auto-Fire OFF and fire_held=false, player must NOT shoot automatically.
+    game.step_playing(1.0 / 60.0, FrameInput::default(), vp);
+    assert!(game.bullets.is_empty());
+
+    // Holding fire trigger shoots immediately.
+    game.step_playing(
+        1.0 / 60.0,
+        FrameInput {
+            fire_held: true,
+            ..FrameInput::default()
+        },
+        vp,
+    );
+    assert!(!game.bullets.is_empty());
+
+    // Particle cap is 50% on Low density, shake scales by 50%, hit-stop stays 0 when disabled.
+    assert_eq!(
+        game.effects.max_particles,
+        crate::game::config::MAX_PARTICLES / 2
+    );
+    game.effects.add_shake(10.0, game.settings.shake_scale());
+    assert!((game.effects.shake - 5.0).abs() < 1e-4);
+    game.effects.add_hit_stop(0.05, game.settings.hit_stop);
+    assert_eq!(game.effects.hit_stop, 0.0);
+}
+
+#[test]
+fn gamepad_deadzone_twin_stick_and_input_merging_work_correctly() {
+    use crate::game::Settings;
+    use crate::input::{merge_playing_inputs, GamepadManager, RawGamepadState};
+
+    let mut mgr = GamepadManager::headless();
+    let settings = Settings {
+        stick_deadzone: 20,
+        ..Settings::default()
+    };
+
+    // Frame 1: drift inside 20% deadzone is ignored; right stick deflected; RT pulled.
+    let raw1 = RawGamepadState {
+        connected: true,
+        left_stick: vec2(0.12, -0.08),
+        right_stick: vec2(0.0, -0.9),
+        rt: 0.85,
+        ..RawGamepadState::default()
+    };
+    let snap1 = mgr.process_raw(raw1, 1.0 / 60.0, settings);
+    assert_eq!(snap1.move_dir, Vec2::ZERO);
+    assert!(snap1.aim_dir.is_some());
+    assert!((snap1.aim_dir.unwrap() - vec2(0.0, -1.0)).length() < 1e-4);
+    assert!(snap1.fire_held);
+    assert!(snap1.dash_pressed); // rising edge
+
+    // Frame 2: holding RT keeps fire_held true, but dash_pressed must NOT re-trigger.
+    let snap2 = mgr.process_raw(raw1, 1.0 / 60.0, settings);
+    assert!(snap2.fire_held);
+    assert!(!snap2.dash_pressed);
+
+    // Twin-stick right stick overrides mouse/touch aim in merge_playing_inputs.
+    let merged = merge_playing_inputs(
+        Vec2::ZERO,
+        vec2(1.0, 0.0),
+        snap1,
+        Some(vec2(1.0, 0.0)),
+        Some(vec2(-1.0, 0.0)),
+        false,
+        false,
+        false,
+    );
+    assert!((merged.move_dir - vec2(1.0, 0.0)).length() < 1e-4);
+    assert!((merged.manual_aim_dir.unwrap() - vec2(0.0, -1.0)).length() < 1e-4);
+    assert!(merged.fire_held);
+    assert!(merged.dash_pressed);
+}
+
+#[test]
+fn gamepad_menu_levelup_pause_and_settings_navigation_work() {
+    use crate::game::Settings;
+    use crate::input::MenuNavInput;
+    use crate::ui::menus::step_menu_focus;
+    use crate::ui::overlays::{step_levelup_nav, step_pause_nav, step_settings_nav, PauseAction};
+
+    // 1. Main menu tab switch (RB) + jump to Resume Run (Back) + Confirm (A)
+    let mut tab = 0_u8;
+    let mut menu_idx = 0_usize;
+    step_menu_focus(
+        &mut tab,
+        &mut menu_idx,
+        MenuNavInput {
+            next_tab: true,
+            ..MenuNavInput::default()
+        },
+        true,
+    );
+    assert_eq!(tab, 1);
+    assert_eq!(menu_idx, 0);
+
+    step_menu_focus(
+        &mut tab,
+        &mut menu_idx,
+        MenuNavInput {
+            back: true,
+            ..MenuNavInput::default()
+        },
+        true,
+    );
+    // Tab 1 has 5 cards + 3 difficulties => action_start = 8 (Resume Run)
+    assert_eq!(menu_idx, 8);
+    let act = step_menu_focus(
+        &mut tab,
+        &mut menu_idx,
+        MenuNavInput {
+            confirm: true,
+            ..MenuNavInput::default()
+        },
+        true,
+    );
+    assert_eq!(act, Some(8));
+
+    // 2. Level-up 3-card draft cycling with RB / Right and confirm
+    let mut lu_idx = 0_usize;
+    assert_eq!(
+        step_levelup_nav(
+            &mut lu_idx,
+            MenuNavInput {
+                next_tab: true,
+                ..MenuNavInput::default()
+            }
+        ),
+        None
+    );
+    assert_eq!(lu_idx, 1);
+    assert_eq!(
+        step_levelup_nav(
+            &mut lu_idx,
+            MenuNavInput {
+                confirm: true,
+                ..MenuNavInput::default()
+            }
+        ),
+        Some(1)
+    );
+
+    // 3. Pause overlay navigation to Save & Quit (index 2)
+    let mut p_idx = 0_usize;
+    step_pause_nav(
+        &mut p_idx,
+        MenuNavInput {
+            down: true,
+            ..MenuNavInput::default()
+        },
+    );
+    step_pause_nav(
+        &mut p_idx,
+        MenuNavInput {
+            down: true,
+            ..MenuNavInput::default()
+        },
+    );
+    assert_eq!(
+        step_pause_nav(
+            &mut p_idx,
+            MenuNavInput {
+                confirm: true,
+                ..MenuNavInput::default()
+            }
+        ),
+        Some(PauseAction::SaveAndQuit)
+    );
+
+    // 4. Settings overlay slider adjustment (Master Volume -10%) + Back
+    let mut st = Settings::default();
+    let mut s_idx = 0_usize; // Master Volume slider
+    assert!(!step_settings_nav(
+        &mut st,
+        &mut s_idx,
+        MenuNavInput {
+            left: true,
+            ..MenuNavInput::default()
+        }
+    ));
+    assert_eq!(st.master_volume, 90);
+    assert!(step_settings_nav(
+        &mut st,
+        &mut s_idx,
+        MenuNavInput {
+            back: true,
+            ..MenuNavInput::default()
+        }
+    ));
 }

@@ -12,14 +12,14 @@ pub fn try_trigger_dash(
     selected_ship: u32,
     sounds: &SoundBank,
     effects: &mut EffectsPool,
-    sound_enabled: bool,
-    shake_enabled: bool,
+    sfx_gain: f32,
+    shake_scale: f32,
 ) -> Option<(Vec2, f32, f32)> {
     if player.dash_cd > 0.0 {
         return None;
     }
 
-    sounds.play(&sounds.dash, sound_enabled, 0.8);
+    sounds.play(&sounds.dash, sfx_gain, 0.8);
     let mine_drop = if selected_ship == 3 {
         Some((player.pos, player.bullet_dmg * 4.5, 138.0))
     } else {
@@ -34,7 +34,7 @@ pub fn try_trigger_dash(
 
     player.dash_timer = player.dash_duration;
     player.dash_cd = player.dash_max_cd;
-    effects.add_shake(2.6, shake_enabled);
+    effects.add_shake(2.6, shake_scale);
     effects.spawn_ring(player.pos, 75.0, ship_by_id(selected_ship).color(), 0.25);
 
     mine_drop
@@ -51,14 +51,14 @@ mod tests {
         let sounds = SoundBank::empty();
         let mut fx = EffectsPool::new();
 
-        let mine = try_trigger_dash(&mut p, vec2(0.0, -1.0), 3, &sounds, &mut fx, false, true);
+        let mine = try_trigger_dash(&mut p, vec2(0.0, -1.0), 3, &sounds, &mut fx, 0.0, 1.0);
         assert!(mine.is_some());
         assert!((p.dash_timer - p.dash_duration).abs() < 1e-5);
         assert!((p.dash_cd - p.dash_max_cd).abs() < 1e-5);
         assert!((p.dash_dir - vec2(0.0, -1.0)).length() < 1e-5);
 
         // Second immediate call must be rejected by cooldown
-        let second = try_trigger_dash(&mut p, vec2(1.0, 0.0), 3, &sounds, &mut fx, false, true);
+        let second = try_trigger_dash(&mut p, vec2(1.0, 0.0), 3, &sounds, &mut fx, 0.0, 1.0);
         assert!(second.is_none());
     }
 }

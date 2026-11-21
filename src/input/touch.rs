@@ -75,6 +75,7 @@ impl TouchState {
             pause_rect.h + 16.0,
         );
 
+        let dz_px = (settings.deadzone_f32() * STICK_MAX_RADIUS).max(2.5);
         for touch in touch_events {
             let tpos = touch.position / vp.scale;
             match touch.phase {
@@ -102,8 +103,10 @@ impl TouchState {
                         self.left_stick.cur = tpos;
                         let delta = tpos - start;
                         let len = delta.length();
-                        self.left_stick.dir = if len > 3.0 {
-                            (delta / len) * (len.min(STICK_MAX_RADIUS) / STICK_MAX_RADIUS)
+                        self.left_stick.dir = if len > dz_px {
+                            let mag = ((len - dz_px) / (STICK_MAX_RADIUS - dz_px).max(1.0))
+                                .clamp(0.0, 1.0);
+                            (delta / len) * mag
                         } else {
                             Vec2::ZERO
                         };
@@ -123,8 +126,10 @@ impl TouchState {
                         } else {
                             tpos
                         };
-                        self.left_stick.dir = if len > 3.0 {
-                            (delta / len) * (len.min(STICK_MAX_RADIUS) / STICK_MAX_RADIUS)
+                        self.left_stick.dir = if len > dz_px {
+                            let mag = ((len - dz_px) / (STICK_MAX_RADIUS - dz_px).max(1.0))
+                                .clamp(0.0, 1.0);
+                            (delta / len) * mag
                         } else {
                             Vec2::ZERO
                         };
@@ -136,7 +141,7 @@ impl TouchState {
                         } else {
                             tpos
                         };
-                        self.right_stick.dir = if len > 4.0 { delta / len } else { Vec2::ZERO };
+                        self.right_stick.dir = if len > dz_px { delta / len } else { Vec2::ZERO };
                     }
                 }
                 TouchPhase::Ended | TouchPhase::Cancelled => {

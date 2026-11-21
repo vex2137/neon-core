@@ -1,4 +1,4 @@
-//! Sound resource bank with rate-limiting for high-frequency firing SFX.
+//! Sound resource bank with rate-limiting and master/SFX volume scaling.
 
 use super::procedural_audio::synth_wav;
 use super::{load_sound_from_bytes, play_sound, PlaySoundParams, Sound};
@@ -46,8 +46,10 @@ impl SoundBank {
         self.shoot_cd = (self.shoot_cd - dt).max(0.0);
     }
 
-    pub fn play(&self, snd: &Option<Sound>, enabled: bool, vol: f32) {
-        if !enabled {
+    /// Plays a sound scaled by `sfx_gain` (`master_volume * sfx_volume` in `0.0..=1.0`).
+    pub fn play(&self, snd: &Option<Sound>, sfx_gain: f32, vol: f32) {
+        let final_vol = (vol * sfx_gain).clamp(0.0, 1.0);
+        if final_vol <= 0.001 || !final_vol.is_finite() {
             return;
         }
         if let Some(s) = snd {
@@ -55,15 +57,15 @@ impl SoundBank {
                 s,
                 PlaySoundParams {
                     looped: false,
-                    volume: vol.clamp(0.0, 1.0),
+                    volume: final_vol,
                 },
             );
         }
     }
 
-    pub fn play_shoot_throttled(&mut self, enabled: bool) {
+    pub fn play_shoot_throttled(&mut self, sfx_gain: f32) {
         if self.shoot_cd <= 0.0 {
-            self.play(&self.shoot, enabled, 0.5);
+            self.play(&self.shoot, sfx_gain, 0.5);
             self.shoot_cd = 0.055;
         }
     }

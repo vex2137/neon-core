@@ -31,6 +31,7 @@ pub fn fnv1a_64(bytes: &[u8]) -> u64 {
 
 /// Serializes `MetaSave` to versioned v2 format with trailing integrity checksum.
 pub fn serialize_v2(save: &MetaSave) -> String {
+    let st = save.settings.validated();
     let body = format!(
         "shards={}\n\
 dmg_lvl={}\n\
@@ -52,7 +53,20 @@ selected_ship={}\n\
 unlocked_ships_mask={}\n\
 difficulty={}\n\
 best_wave={}\n\
-best_kills={}\n",
+best_kills={}\n\
+set_sound={}\n\
+set_master_vol={}\n\
+set_sfx_vol={}\n\
+set_shake={}\n\
+set_hit_stop={}\n\
+set_dmg_nums={}\n\
+set_high_particles={}\n\
+set_fixed_stick={}\n\
+set_auto_aim={}\n\
+set_auto_fire={}\n\
+set_deadzone={}\n\
+set_vibration={}\n\
+set_perf_hud={}\n",
         save.shards,
         save.dmg_lvl,
         save.rate_lvl,
@@ -73,7 +87,20 @@ best_kills={}\n",
         save.unlocked_ships_mask,
         save.difficulty,
         save.best_wave,
-        save.best_kills
+        save.best_kills,
+        u32::from(st.sound),
+        st.master_volume,
+        st.sfx_volume,
+        st.shake_intensity,
+        u32::from(st.hit_stop),
+        u32::from(st.dmg_nums),
+        u32::from(st.high_particles),
+        u32::from(st.fixed_stick),
+        u32::from(st.auto_aim),
+        u32::from(st.auto_fire),
+        st.stick_deadzone,
+        u32::from(st.vibration),
+        u32::from(st.perf_hud)
     );
     let csum = fnv1a_64(body.as_bytes());
     format!("{SAVE_HEADER_V2}\n{body}checksum={csum:016x}\n")
@@ -148,6 +175,19 @@ fn parse_v2(raw: &str) -> Result<MetaSave, ParseError> {
             "difficulty" => save.difficulty = num,
             "best_wave" => save.best_wave = num,
             "best_kills" => save.best_kills = num,
+            "set_sound" => save.settings.sound = num != 0,
+            "set_master_vol" => save.settings.master_volume = num.min(100) as u8,
+            "set_sfx_vol" => save.settings.sfx_volume = num.min(100) as u8,
+            "set_shake" => save.settings.shake_intensity = num.min(100) as u8,
+            "set_hit_stop" => save.settings.hit_stop = num != 0,
+            "set_dmg_nums" => save.settings.dmg_nums = num != 0,
+            "set_high_particles" => save.settings.high_particles = num != 0,
+            "set_fixed_stick" => save.settings.fixed_stick = num != 0,
+            "set_auto_aim" => save.settings.auto_aim = num != 0,
+            "set_auto_fire" => save.settings.auto_fire = num != 0,
+            "set_deadzone" => save.settings.stick_deadzone = num.min(30) as u8,
+            "set_vibration" => save.settings.vibration = num != 0,
+            "set_perf_hud" => save.settings.perf_hud = num != 0,
             _ => {
                 // Unknown optional fields from future versions are safely ignored.
             }
@@ -247,6 +287,7 @@ mod tests {
             difficulty: 2,
             best_wave: 24,
             best_kills: 1850,
+            settings: crate::game::state::Settings::default(),
         };
         let encoded = serialize_v2(&original);
         let (decoded, fmt) = parse_save(&encoded).expect("v2 save must parse");

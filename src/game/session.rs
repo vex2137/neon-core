@@ -1,13 +1,15 @@
-//! Run lifecycle transitions: starting runs, pausing/resuming, wave transitions, and finishing runs.
+//! Run lifecycle transitions: starting runs, mid-run save/resume, pausing, wave transitions, and finishing runs.
 
 use super::config::{Viewport, ARENA_RADIUS, DEMO_MAX_WAVE};
 use super::state::ScreenState;
 use super::Game;
 use crate::effects::TextBuf;
 use crate::enemies::EnemyKind;
+use crate::persistence::{RunSnapshot, RunSummary};
 use crate::progression::{
     boss_count_for_wave, event_for_wave, next_level_xp, roll_three_upgrades, WaveEvent,
 };
+use crate::rng::GameRng;
 use crate::world::clamp_to_arena;
 use macroquad::color::Color;
 use macroquad::math::{vec2, Vec2};
@@ -15,6 +17,9 @@ use std::fmt::Write;
 
 impl Game {
     pub fn start_run(&mut self, vp: Viewport) {
+        // Starting a fresh run clears any previously saved mid-run state.
+        self.delete_saved_run();
+
         self.bullets.clear();
         self.e_bullets.clear();
         self.hazards.clear();
@@ -23,6 +28,7 @@ impl Game {
         self.enemies_dirty = false;
         self.gems.clear();
         self.effects.clear();
+        self.effects.set_particle_cap(self.settings.particle_cap());
         self.touch.clear();
 
         let diff = self.difficulty();
@@ -70,9 +76,147 @@ impl Game {
         self.state = ScreenState::Playing;
     }
 
+    /// Captures a complete, deterministic mid-run snapshot for serialization.
+    pub fn capture_run_snapshot(&self) -> RunSnapshot {
+        RunSnapshot {
+            ship_id: self.meta.selected_ship,
+            difficulty: self.meta.difficulty,
+            wave: self.wave,
+            wave_timer: self.wave_timer,
+            wave_event: self.wave_event,
+            rng_state: self.rng.state(),
+            xp: self.xp,
+            next_xp: self.next_xp,
+            level: self.level,
+            combo: self.combo,
+            combo_timer: self.combo_timer,
+            spawn_accum: self.spawn_accum,
+            run_shards: self.run_shards,
+            kills: self.kills,
+            hazard_spawn_timer: self.hazard_spawn_timer,
+            beacon_spawn_timer: self.beacon_spawn_timer,
+            beacon: self.beacon,
+            player: self.player,
+            enemies: self.enemies.iter().copied().filter(|e| e.alive).collect(),
+            bullets: self.bullets.clone(),
+            e_bullets: self.e_bullets.clone(),
+            hazards: self.hazards.clone(),
+            mines: self.mines.clone(),
+            gems: self.gems.clone(),
+        }
+    }
+
+    /// Restores a previously saved mid-run snapshot and enters active gameplay.
+    pub fn restore_run_snapshot(&mut self, snap: RunSnapshot) {
+        let snap = snap.validated();
+        self.meta.selected_ship = snap.ship_id;
+        self.meta.difficulty = snap.difficulty;
+        self.wave = snap.wave;
+        self.wave_timer = snap.wave_timer;
+        self.wave_event = snap.wave_event;
+        self.rng = GameRng::seeded(snap.rng_state);
+        self.xp = snap.xp;
+        self.next_xp = snap.next_xp;
+        self.level = snap.level;
+        self.combo = snap.combo;
+        self.combo_timer = snap.combo_timer;
+        self.spawn_accum = snap.spawn_accum;
+        self.run_shards = snap.run_shards;
+        self.kills = snap.kills;
+        self.hazard_spawn_timer = snap.hazard_spawn_timer;
+        self.beacon_spawn_timer = snap.beacon_spawn_timer;
+        self.beacon = snap.beacon;
+        self.player = snap.player;
+        self.enemies = snap.enemies;
+        self.enemies_dirty = false;
+        self.bullets = snap.bullets;
+        self.e_bullets = snap.e_bullets;
+        self.hazards = snap.hazards;
+        self.mines = snap.mines;
+        self.gems = snap.gems;
+        self.effects.clear();
+        self.effects.set_particle_cap(self.settings.particle_cap());
+        self.touch.clear();
+        self.is_new_record = false;
+        self.xp_popup_accum = 0.0;
+        self.shard_popup_accum = 0;
+        self.pickup_popup_timer = 0.0;
+        self.rebuild_spatial_grid();
+
+        let ship = self.selected_ship();
+        let diff = self.difficulty();
+        let mut title = TextBuf::<64>::new();
+        let _ = write!(
+            &mut title,
+            "WZNOWIONO - FALA {} ({})",
+            self.wave, ship.short_name
+        );
+        self.banner
+            .show(title.as_str(), "KONTYNUACJA MISJI", 2.4, diff.color());
+        self.state = ScreenState::Playing;
+    }
+
+    /// Saves the active run to disk (when persistence is enabled) and updates cached menu summary.
+    pub fn save_active_run(&mut self) {
+        let snap = self.capture_run_snapshot();
+        let summary = snap.summary();
+        if self.persist_saves {
+            snap.save_default();
+        }
+        self.saved_run_summary = Some(summary);
+    }
+
+    /// Saves the active run and returns to the Hangar/Main Menu.
+    pub fn save_and_quit_to_menu(&mut self) {
+        self.touch.clear();
+        self.save_active_run();
+        self.ui_focus.menu_idx = 0;
+        self.state = ScreenState::Menu;
+    }
+
+    /// Loads `neon_core_run.dat` from disk and resumes it. Returns `true` if a valid save existed.
+    pub fn resume_saved_run(&mut self) -> bool {
+        if let Some(snap) = RunSnapshot::load_default() {
+            self.restore_run_snapshot(snap);
+            true
+        } else {
+            self.saved_run_summary = None;
+            false
+        }
+    }
+
+    /// Deletes any mid-run save file (called on run end or starting a new run).
+    pub fn delete_saved_run(&mut self) {
+        if self.persist_saves {
+            RunSnapshot::delete_default();
+        }
+        self.saved_run_summary = None;
+    }
+
+    /// Refreshes the cached `RunSummary` from disk without blocking hot paths.
+    #[allow(dead_code)]
+    pub fn refresh_saved_run_summary(&mut self) -> Option<RunSummary> {
+        if self.persist_saves {
+            self.saved_run_summary = RunSnapshot::load_summary_default();
+        }
+        self.saved_run_summary
+    }
+
+    /// Syncs expanded `Settings` into `MetaSave`, updates live effect caps, and persists to disk.
+    pub fn commit_settings(&mut self) {
+        self.settings = self.settings.validated();
+        self.effects.set_particle_cap(self.settings.particle_cap());
+        self.meta.settings = self.settings;
+        if self.persist_saves {
+            self.meta.save();
+        }
+    }
+
     pub fn pause_run(&mut self) {
         if self.state == ScreenState::Playing {
             self.touch.clear();
+            self.save_active_run();
+            self.ui_focus.pause_idx = 0;
             self.state = ScreenState::Paused;
         }
     }
@@ -85,6 +229,7 @@ impl Game {
     pub fn roll_levelup(&mut self) {
         self.touch.clear();
         self.level_choices = roll_three_upgrades(&mut self.rng);
+        self.ui_focus.levelup_idx = 0;
         self.state = ScreenState::LevelUp;
     }
 
@@ -96,6 +241,9 @@ impl Game {
 
     pub fn finish_run(&mut self, victory: bool) {
         self.touch.clear();
+        // Immediately delete mid-run save on death/completion to prevent save-scumming.
+        self.delete_saved_run();
+
         self.meta.shards = self.meta.shards.saturating_add(self.run_shards);
         self.is_new_record = self.wave > self.meta.best_wave || self.kills > self.meta.best_kills;
         if self.wave > self.meta.best_wave {
@@ -210,7 +358,9 @@ impl Game {
             }
         }
         self.sounds
-            .play(&self.sounds.lvlup, self.settings.sound, 0.55);
+            .play(&self.sounds.lvlup, self.settings.effective_sfx_gain(), 0.55);
+        // Auto-save checkpoint on every wave transition.
+        self.save_active_run();
     }
 
     pub fn complete_beacon(&mut self) {
@@ -236,9 +386,11 @@ impl Game {
         let _ = write!(&mut msg, "OVERDRIVE! +{} SHARDS", bonus_shards);
         self.effects.spawn_text(bpos + vec2(0.0, -28.0), msg, gold);
         self.sounds
-            .play(&self.sounds.lvlup, self.settings.sound, 0.95);
-        self.effects.add_shake(7.0, self.settings.shake);
-        self.effects.add_hit_stop(0.045);
+            .play(&self.sounds.lvlup, self.settings.effective_sfx_gain(), 0.95);
+        self.effects.add_shake(7.0, self.settings.shake_scale());
+        self.effects.add_hit_stop(0.045, self.settings.hit_stop);
+        self.gamepad
+            .trigger_rumble(0.55, 110, self.settings.vibration);
 
         if self.xp >= self.next_xp {
             self.xp -= self.next_xp;

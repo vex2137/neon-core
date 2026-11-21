@@ -19,6 +19,12 @@ impl GameRng {
         Self { state: s }
     }
 
+    /// Returns the internal PRNG state for mid-run save serialization.
+    #[inline]
+    pub fn state(&self) -> u64 {
+        self.state
+    }
+
     /// Creates a runtime RNG seeded from system time when available.
     pub fn from_entropy() -> Self {
         #[cfg(not(target_arch = "wasm32"))]
