@@ -24,8 +24,54 @@ mod wasm_audio {
 #[cfg(target_arch = "wasm32")]
 use wasm_audio::{load_sound_from_bytes, play_sound, PlaySoundParams, Sound};
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+const VIRTUAL_HEIGHT: f32 = 540.0;
 const ARENA_RADIUS: f32 = 2800.0;
 const DEMO_MAX_WAVE: u32 = 8;
+
+static ANDROID_PAUSE_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "C" fn Java_dev_vex_neon_1core_MainActivity_neonOnPause(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+) {
+    ANDROID_PAUSE_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+#[derive(Clone, Copy)]
+struct Viewport {
+    sw: f32,
+    sh: f32,
+    scale: f32,
+    vw: f32,
+    vh: f32,
+    safe_x: f32,
+}
+
+impl Viewport {
+    #[inline]
+    fn current() -> Self {
+        let sw = screen_width().max(1.0);
+        let sh = screen_height().max(1.0);
+        let by_h = sh / VIRTUAL_HEIGHT;
+        let by_w = sw / 640.0;
+        let scale = by_h.min(by_w).max(0.45);
+        let vw = sw / scale;
+        let vh = sh / scale;
+        let aspect = vw / vh.max(1.0);
+        let safe_x = if aspect >= 1.95 {
+            36.0
+        } else if aspect >= 1.7 {
+            18.0
+        } else {
+            12.0
+        };
+        Self { sw, sh, scale, vw, vh, safe_x }
+    }
+}
 
 // Spatial hash grid for O(1) enemy lookups
 const CELL_SIZE: f32 = 128.0;
@@ -705,6 +751,10 @@ struct Game {
     kills: u32,
     is_new_record: bool,
     shake: f32,
+    hit_stop: f32,
+    xp_popup_accum: f32,
+    shard_popup_accum: u32,
+    pickup_popup_timer: f32,
 
     move_speed: f32,
     fire_cd: f32,
@@ -816,6 +866,10 @@ impl Game {
             kills: 0,
             is_new_record: false,
             shake: 0.0,
+            hit_stop: 0.0,
+            xp_popup_accum: 0.0,
+            shard_popup_accum: 0,
+            pickup_popup_timer: 0.0,
 
             move_speed: 275.0,
             fire_cd: 0.0,
@@ -918,6 +972,11 @@ impl Game {
         self.run_shards = 0;
         self.kills = 0;
         self.is_new_record = false;
+        self.shake = 0.0;
+        self.hit_stop = 0.0;
+        self.xp_popup_accum = 0.0;
+        self.shard_popup_accum = 0;
+        self.pickup_popup_timer = 0.0;
 
         let ship_hp_mult = if ship_id == 2 { 1.7 } else if ship_id == 1 { 0.85 } else { 1.0 };
         self.max_hp = ((100.0 + self.meta.hp_lvl as f32 * 30.0) * prestige_hp * ship_hp_mult).round();
@@ -978,77 +1037,117 @@ impl Game {
         }
         self.dash_timer = self.dash_duration;
         self.dash_cd = self.dash_max_cd;
+        if self.settings.shake {
+            self.shake = self.shake.max(2.6);
+        }
         let ring_col = self.selected_ship().color();
         self.spawn_ring(self.player_pos, 75.0, ring_col, 0.25);
     }
 
-    fn pause_rect(&self) -> Rect {
-        let sw = screen_width();
-        let size = if sw < 460.0 { 36.0 } else { 42.0 };
-        Rect::new(sw - size - 10.0, 10.0, size, size)
+    fn pause_rect(&self, vp: Viewport) -> Rect {
+        let size = if vp.vw < 700.0 { 38.0 } else { 42.0 };
+        Rect::new(vp.vw - vp.safe_x - size, 12.0, size, size)
+    }
+
+    fn dash_center(&self, vp: Viewport) -> Vec2 {
+        vec2(vp.vw - vp.safe_x - 66.0, vp.vh - 74.0)
+    }
+
+    fn left_stick_rest(&self, vp: Viewport) -> Vec2 {
+        vec2(vp.safe_x + 68.0, vp.vh - 76.0)
     }
 
     fn update_playing(&mut self, dt: f32) {
-        let sw = screen_width();
-        let sh = screen_height();
+        let vp = Viewport::current();
+        let pause_rect = self.pause_rect(vp);
+        let dash_center = self.dash_center(vp);
+        let stick_rest = self.left_stick_rest(vp);
+        let stick_max_r = 52.0_f32;
 
-        let pause_rect = self.pause_rect();
-        let dash_center = vec2(sw - 58.0, sh - 62.0);
+        // Allow clicking the virtual pause button with mouse on desktop/WASM
+        if touches().is_empty() && is_mouse_button_pressed(MouseButton::Left) {
+            let (mx, my) = mouse_position();
+            let vm = vec2(mx / vp.scale, my / vp.scale);
+            if pause_rect.contains(vm) {
+                self.left_stick = Stick::new();
+                self.right_stick = Stick::new();
+                self.state = ScreenState::Paused;
+                return;
+            }
+            if vm.distance_squared(dash_center) <= 52.0 * 52.0 {
+                self.trigger_dash();
+            }
+        }
 
         for touch in touches() {
+            let tpos = touch.position / vp.scale;
             match touch.phase {
                 TouchPhase::Started => {
-                    if pause_rect.contains(touch.position) {
+                    let expanded_pause = Rect::new(
+                        pause_rect.x - 8.0,
+                        pause_rect.y - 8.0,
+                        pause_rect.w + 16.0,
+                        pause_rect.h + 16.0,
+                    );
+                    if expanded_pause.contains(tpos) {
+                        self.left_stick = Stick::new();
+                        self.right_stick = Stick::new();
                         self.state = ScreenState::Paused;
                         return;
                     }
-                    if touch.position.distance_squared(dash_center) <= 44.0 * 44.0 {
+                    if tpos.distance_squared(dash_center) <= 58.0 * 58.0 {
                         self.trigger_dash();
                         continue;
                     }
-                    let want_move = if self.settings.auto_aim {
-                        self.left_stick.touch_id.is_none()
-                    } else {
-                        touch.position.x < sw * 0.5 && self.left_stick.touch_id.is_none()
-                    };
-
-                    if want_move {
+                    if tpos.x < vp.vw * 0.52 && self.left_stick.touch_id.is_none() {
                         let start = if self.settings.fixed_stick {
-                            vec2(86.0, sh - 96.0)
+                            stick_rest
                         } else {
-                            touch.position
+                            vec2(
+                                tpos.x.clamp(vp.safe_x + 42.0, vp.vw * 0.50),
+                                tpos.y.clamp(84.0, vp.vh - 46.0),
+                            )
                         };
                         self.left_stick.touch_id = Some(touch.id);
                         self.left_stick.start = start;
-                        self.left_stick.cur = touch.position;
-                        let delta = touch.position - start;
+                        self.left_stick.cur = tpos;
+                        let delta = tpos - start;
                         let len = delta.length();
-                        self.left_stick.dir = if len > 2.0 {
-                            (delta / len) * (len.min(44.0) / 44.0)
+                        self.left_stick.dir = if len > 3.0 {
+                            (delta / len) * (len.min(stick_max_r) / stick_max_r)
                         } else {
                             Vec2::ZERO
                         };
-                    } else if self.right_stick.touch_id.is_none() {
+                    } else if !self.settings.auto_aim && self.right_stick.touch_id.is_none() {
                         self.right_stick.touch_id = Some(touch.id);
-                        self.right_stick.start = touch.position;
-                        self.right_stick.cur = touch.position;
+                        self.right_stick.start = tpos;
+                        self.right_stick.cur = tpos;
                         self.right_stick.dir = Vec2::ZERO;
                     }
                 }
                 TouchPhase::Moved | TouchPhase::Stationary => {
                     if Some(touch.id) == self.left_stick.touch_id {
-                        self.left_stick.cur = touch.position;
-                        let delta = touch.position - self.left_stick.start;
+                        let delta = tpos - self.left_stick.start;
                         let len = delta.length();
-                        self.left_stick.dir = if len > 2.0 {
-                            (delta / len) * (len.min(44.0) / 44.0)
+                        let clamped = if len > stick_max_r {
+                            self.left_stick.start + (delta / len) * stick_max_r
+                        } else {
+                            tpos
+                        };
+                        self.left_stick.cur = clamped;
+                        self.left_stick.dir = if len > 3.0 {
+                            (delta / len) * (len.min(stick_max_r) / stick_max_r)
                         } else {
                             Vec2::ZERO
                         };
                     } else if Some(touch.id) == self.right_stick.touch_id {
-                        self.right_stick.cur = touch.position;
-                        let delta = touch.position - self.right_stick.start;
+                        let delta = tpos - self.right_stick.start;
                         let len = delta.length();
+                        self.right_stick.cur = if len > stick_max_r {
+                            self.right_stick.start + (delta / len) * stick_max_r
+                        } else {
+                            tpos
+                        };
                         self.right_stick.dir = if len > 4.0 { delta / len } else { Vec2::ZERO };
                     }
                 }
@@ -1068,7 +1167,18 @@ impl Game {
             self.trigger_dash();
         }
         if is_key_pressed(KeyCode::Escape) {
+            self.left_stick = Stick::new();
+            self.right_stick = Stick::new();
             self.state = ScreenState::Paused;
+            return;
+        }
+
+        // Brief tactile hit-stop on elite/boss kills & beacon captures
+        if self.hit_stop > 0.0 {
+            self.hit_stop = (self.hit_stop - dt).max(0.0);
+            if self.shake > 0.0 {
+                self.shake = (self.shake - dt * 22.0).max(0.0);
+            }
             return;
         }
 
@@ -1629,9 +1739,13 @@ impl Game {
             }
             if dist_sq < 24.0 * 24.0 {
                 let g = self.gems.swap_remove(gi);
-                self.xp += g.xp * self.greed_mult * combo_mult;
+                let gained_xp = g.xp * self.greed_mult * combo_mult;
+                self.xp += gained_xp;
+                self.xp_popup_accum += gained_xp;
                 if g.shard > 0 {
-                    self.run_shards += ((g.shard as f32 * self.greed_mult).round() as u32).max(1);
+                    let gained_sh = ((g.shard as f32 * self.greed_mult).round() as u32).max(1);
+                    self.run_shards += gained_sh;
+                    self.shard_popup_accum += gained_sh;
                 }
                 if self.xp >= self.next_xp {
                     self.xp -= self.next_xp;
@@ -1643,6 +1757,33 @@ impl Game {
                     return;
                 }
             }
+        }
+
+        // Batched crisp floating +XP / +SHARD pickup popups
+        if self.pickup_popup_timer > 0.0 {
+            self.pickup_popup_timer = (self.pickup_popup_timer - dt).max(0.0);
+        }
+        if self.pickup_popup_timer <= 0.0 && (self.shard_popup_accum > 0 || self.xp_popup_accum >= 6.0) {
+            let ppos = self.player_pos;
+            if self.shard_popup_accum > 0 {
+                let amt = self.shard_popup_accum;
+                self.shard_popup_accum = 0;
+                self.spawn_text(
+                    ppos + vec2(rand::gen_range(-12.0, 12.0), -30.0),
+                    format!("+{} SHARD", amt),
+                    Color::from_rgba(249, 200, 14, 255),
+                );
+            }
+            if self.xp_popup_accum >= 6.0 {
+                let amt = self.xp_popup_accum.round() as u32;
+                self.xp_popup_accum = 0.0;
+                self.spawn_text(
+                    ppos + vec2(rand::gen_range(-14.0, 14.0), -18.0),
+                    format!("+{} XP", amt),
+                    Color::from_rgba(125, 249, 255, 255),
+                );
+            }
+            self.pickup_popup_timer = 0.16;
         }
 
         // Update VFX (dense swap_remove)
@@ -1753,7 +1894,7 @@ impl Game {
         let dmg = if is_crit { raw_dmg * 2.0 } else { raw_dmg };
 
         self.enemies[idx].hp -= dmg;
-        self.enemies[idx].flash = 0.06;
+        self.enemies[idx].flash = 0.075;
         if show_num && self.settings.dmg_nums {
             let col = if is_crit || dmg >= 35.0 { Color::from_rgba(249, 200, 14, 255) } else { WHITE };
             let pos = self.enemies[idx].pos + vec2(rand::gen_range(-8.0, 8.0), -self.enemies[idx].radius);
@@ -1775,6 +1916,11 @@ impl Game {
             self.sounds.play(&self.sounds.boom, self.settings.sound, if kind == 3 { 1.0 } else if elite { 0.8 } else { 0.6 });
             if self.settings.shake {
                 self.shake = self.shake.max(if kind == 3 { 12.0 } else if elite { 6.5 } else { 3.5 });
+            }
+            if kind == 3 {
+                self.hit_stop = self.hit_stop.max(0.055);
+            } else if elite {
+                self.hit_stop = self.hit_stop.max(0.024);
             }
 
             let col = match kind {
@@ -2096,6 +2242,7 @@ impl Game {
         if self.settings.shake {
             self.shake = self.shake.max(7.0);
         }
+        self.hit_stop = self.hit_stop.max(0.045);
         if self.xp >= self.next_xp {
             self.xp -= self.next_xp;
             self.level += 1;
@@ -2163,8 +2310,9 @@ impl Game {
     }
 
     fn spawn_enemy(&mut self, kind: u8) {
+        let vp = Viewport::current();
         let angle = rand::gen_range(0.0, std::f32::consts::TAU);
-        let dist = (screen_width().max(screen_height()) * 0.62 + 80.0).min(ARENA_RADIUS - 80.0);
+        let dist = (vp.vw.max(vp.vh) * 0.56 + 75.0).min(ARENA_RADIUS - 80.0);
         let mut pos = self.player_pos + Vec2::from_angle(angle) * dist;
         let limit = ARENA_RADIUS - 45.0;
         let len_sq = pos.length_squared();
@@ -2246,34 +2394,47 @@ impl Game {
     }
 
     fn render_world(&self) {
-        let sw = screen_width();
-        let sh = screen_height();
+        let vp = Viewport::current();
+        let vw = vp.vw;
+        let vh = vp.vh;
         let sx = if self.shake > 0.0 { rand::gen_range(-self.shake, self.shake) } else { 0.0 };
         let sy = if self.shake > 0.0 { rand::gen_range(-self.shake, self.shake) } else { 0.0 };
 
-        // Parallax starfield
+        // Parallax starfield scaled to high-DPI virtual viewport
         for (pos, z, size) in &self.stars {
             let x = ((pos.x - self.player_pos.x * *z).rem_euclid(3200.0)) - 800.0;
             let y = ((pos.y - self.player_pos.y * *z).rem_euclid(3200.0)) - 800.0;
-            if x >= -5.0 && x <= sw + 5.0 && y >= -5.0 && y <= sh + 5.0 {
-                draw_rectangle(x, y, *size, *size, Color::from_rgba(140, 210, 255, 110));
+            if x >= -5.0 && x <= vw + 5.0 && y >= -5.0 && y <= vh + 5.0 {
+                draw_rectangle(
+                    x * vp.scale,
+                    y * vp.scale,
+                    *size * vp.scale,
+                    *size * vp.scale,
+                    Color::from_rgba(140, 210, 255, 110),
+                );
             }
         }
 
-        let cam_rect = Rect::new(self.player_pos.x - sw * 0.5 + sx, self.player_pos.y - sh * 0.5 + sy, sw, sh);
+        // Virtual world camera zoomed by screen_height / VIRTUAL_HEIGHT
+        let cam_rect = Rect::new(
+            self.player_pos.x - vw * 0.5 + sx,
+            self.player_pos.y - vh * 0.5 + sy,
+            vw,
+            vh,
+        );
         let vmin_x = cam_rect.x - 60.0;
-        let vmax_x = cam_rect.x + sw + 60.0;
+        let vmax_x = cam_rect.x + vw + 60.0;
         let vmin_y = cam_rect.y - 60.0;
-        let vmax_y = cam_rect.y + sh + 60.0;
+        let vmax_y = cam_rect.y + vh + 60.0;
 
         set_camera(&Camera2D::from_display_rect(cam_rect));
 
         // Cyber grid
         let grid = 80.0;
         let start_x = ((cam_rect.x / grid).floor() * grid).max(-ARENA_RADIUS);
-        let end_x = (cam_rect.x + sw).min(ARENA_RADIUS);
+        let end_x = (cam_rect.x + vw).min(ARENA_RADIUS);
         let start_y = ((cam_rect.y / grid).floor() * grid).max(-ARENA_RADIUS);
-        let end_y = (cam_rect.y + sh).min(ARENA_RADIUS);
+        let end_y = (cam_rect.y + vh).min(ARENA_RADIUS);
         let grid_col = Color::from_rgba(5, 217, 232, 18);
 
         let mut gx = start_x;
@@ -2429,9 +2590,10 @@ impl Game {
             }
             let mut glow_col = base_col;
             glow_col.a = 0.28;
+            let draw_r = if e.flash > 0.0 { e.radius * 1.12 } else { e.radius };
             let deg = e.angle.to_degrees();
-            draw_poly_lines(e.pos.x, e.pos.y, sides, e.radius, deg, 7.0, glow_col);
-            draw_poly_lines(e.pos.x, e.pos.y, sides, e.radius, deg, 2.2, base_col);
+            draw_poly_lines(e.pos.x, e.pos.y, sides, draw_r, deg, 7.0, glow_col);
+            draw_poly_lines(e.pos.x, e.pos.y, sides, draw_r, deg, 2.2, base_col);
 
             if (e.kind == 2 || e.kind == 3 || e.kind == 6 || e.elite) && e.hp < e.max_hp {
                 let bw = e.radius * 2.0;
@@ -2530,7 +2692,7 @@ impl Game {
         // Off-screen Overload Beacon gold diamond indicator
         if self.beacon.active {
             let bdiff = self.beacon.pos - p;
-            if bdiff.x.abs() > sw * 0.44 || bdiff.y.abs() > sh * 0.44 {
+            if bdiff.x.abs() > vw * 0.44 || bdiff.y.abs() > vh * 0.44 {
                 let ind = p + bdiff.normalize() * 56.0;
                 let deg = bdiff.y.atan2(bdiff.x).to_degrees();
                 draw_poly_lines(ind.x, ind.y, 4, 6.5, deg, 2.2, Color::from_rgba(249, 200, 14, 255));
@@ -2542,7 +2704,7 @@ impl Game {
             if !e.alive { continue; }
             if e.kind != 3 && !e.elite && (idx & 3) != 0 { continue; }
             let diff = e.pos - p;
-            if diff.x.abs() > sw * 0.48 || diff.y.abs() > sh * 0.48 {
+            if diff.x.abs() > vw * 0.48 || diff.y.abs() > vh * 0.48 {
                 let ind = p + diff.normalize() * 46.0;
                 let c = if e.kind == 3 {
                     Color::from_rgba(184, 41, 234, 255)
@@ -2565,65 +2727,107 @@ impl Game {
             draw_rectangle(pt.pos.x - pt.size * 0.5, pt.pos.y - pt.size * 0.5, pt.size, pt.size, c);
         }
 
-        // Damage numbers (frustum culled)
+        set_default_camera();
+
+        // Floating damage & +XP / +SHARD popups rendered at native high-DPI ui_scale
+        let s = vp.scale;
         for t in &self.texts {
             if t.pos.x < vmin_x || t.pos.x > vmax_x || t.pos.y < vmin_y || t.pos.y > vmax_y {
                 continue;
             }
+            let scr_x = (t.pos.x - cam_rect.x) * s;
+            let scr_y = (t.pos.y - cam_rect.y) * s;
+            let alpha = (t.life * 2.0).clamp(0.0, 1.0);
             let mut c = t.color;
-            c.a = (t.life * 2.0).clamp(0.0, 1.0);
-            draw_text(&t.val, t.pos.x - 10.0, t.pos.y, 18.0, c);
+            c.a = alpha;
+            let f_sz = 15.5 * s;
+            let shadow = Color::from_rgba(4, 6, 11, (alpha * 210.0) as u8);
+            draw_centered_text(&t.val, scr_x + 1.2 * s, scr_y + 1.2 * s, f_sz, shadow);
+            draw_centered_text(&t.val, scr_x, scr_y, f_sz, c);
         }
-
-        set_default_camera();
     }
 
     fn render_hud(&self) {
-        let sw = screen_width();
-        let sh = screen_height();
-        let compact = sw < 520.0;
+        let vp = Viewport::current();
+        let s = vp.scale;
+        let vw = vp.vw;
+        let vh = vp.vh;
+        let sx_pad = vp.safe_x;
+        let compact = vw < 700.0;
         let cyan = Color::from_rgba(5, 217, 232, 255);
         let pink = Color::from_rgba(255, 42, 109, 255);
         let gold = Color::from_rgba(249, 200, 14, 255);
         let purple = Color::from_rgba(184, 41, 234, 255);
 
-        let pause_rect = self.pause_rect();
+        let pause_rect = self.pause_rect(vp);
 
-        // Left: HP, optional Plasma SHIELD, & XP bars (responsive width)
-        let bar_w = (sw * if compact { 0.25 } else { 0.28 }).clamp(88.0, 168.0);
-        let lbl_sz = if compact { 14.0 } else { 17.0 };
-        draw_text(&format!("HULL {}/{}", self.hp.ceil() as i32, self.max_hp as i32), 12.0, 22.0, lbl_sz, WHITE);
-        draw_rectangle(12.0, 28.0, bar_w, 8.0, Color::from_rgba(255, 255, 255, 25));
-        draw_rectangle(12.0, 28.0, bar_w * (self.hp / self.max_hp).clamp(0.0, 1.0), 8.0, pink);
-        draw_rectangle_lines(12.0, 28.0, bar_w, 8.0, 1.0, cyan);
+        // Left: HP, optional Plasma SHIELD, & XP bars (safe-area padded & ui_scale multiplied)
+        let bar_w = (vw * if compact { 0.24 } else { 0.22 }).clamp(125.0, 195.0);
+        let lbl_sz = if compact { 15.0 } else { 17.0 };
+        draw_text(
+            &format!("HULL {}/{}", self.hp.ceil() as i32, self.max_hp as i32),
+            sx_pad * s,
+            24.0 * s,
+            lbl_sz * s,
+            WHITE,
+        );
+        draw_rectangle(sx_pad * s, 30.0 * s, bar_w * s, 9.0 * s, Color::from_rgba(255, 255, 255, 25));
+        draw_rectangle(
+            sx_pad * s,
+            30.0 * s,
+            bar_w * (self.hp / self.max_hp).clamp(0.0, 1.0) * s,
+            9.0 * s,
+            pink,
+        );
+        draw_rectangle_lines(sx_pad * s, 30.0 * s, bar_w * s, 9.0 * s, 1.2 * s, cyan);
 
-        let mut left_y = 40.0;
+        let mut left_y = 43.0;
         if self.max_shield > 0.0 {
             let lcyan = Color::from_rgba(125, 249, 255, 255);
-            draw_rectangle(12.0, left_y, bar_w, 6.0, Color::from_rgba(255, 255, 255, 20));
-            draw_rectangle(12.0, left_y, bar_w * (self.shield / self.max_shield).clamp(0.0, 1.0), 6.0, lcyan);
-            draw_rectangle_lines(12.0, left_y, bar_w, 6.0, 1.0, Color::from_rgba(125, 249, 255, 190));
-            left_y += 10.0;
+            draw_rectangle(sx_pad * s, left_y * s, bar_w * s, 6.5 * s, Color::from_rgba(255, 255, 255, 20));
+            draw_rectangle(
+                sx_pad * s,
+                left_y * s,
+                bar_w * (self.shield / self.max_shield).clamp(0.0, 1.0) * s,
+                6.5 * s,
+                lcyan,
+            );
+            draw_rectangle_lines(
+                sx_pad * s,
+                left_y * s,
+                bar_w * s,
+                6.5 * s,
+                1.0 * s,
+                Color::from_rgba(125, 249, 255, 190),
+            );
+            left_y += 10.5;
         }
 
-        let lvl_lbl_y = left_y + 12.0;
-        let lvl_bar_y = left_y + 18.0;
-        draw_text(&format!("LVL {}", self.level), 12.0, lvl_lbl_y, lbl_sz, WHITE);
-        draw_rectangle(12.0, lvl_bar_y, bar_w, 8.0, Color::from_rgba(255, 255, 255, 25));
-        draw_rectangle(12.0, lvl_bar_y, bar_w * (self.xp / self.next_xp).clamp(0.0, 1.0), 8.0, cyan);
-        draw_rectangle_lines(12.0, lvl_bar_y, bar_w, 8.0, 1.0, cyan);
+        let lvl_lbl_y = left_y + 13.0;
+        let lvl_bar_y = left_y + 19.0;
+        draw_text(&format!("LVL {}", self.level), sx_pad * s, lvl_lbl_y * s, lbl_sz * s, WHITE);
+        draw_rectangle(sx_pad * s, lvl_bar_y * s, bar_w * s, 9.0 * s, Color::from_rgba(255, 255, 255, 25));
+        draw_rectangle(
+            sx_pad * s,
+            lvl_bar_y * s,
+            bar_w * (self.xp / self.next_xp).clamp(0.0, 1.0) * s,
+            9.0 * s,
+            cyan,
+        );
+        draw_rectangle_lines(sx_pad * s, lvl_bar_y * s, bar_w * s, 9.0 * s, 1.2 * s, cyan);
 
         // Subtle red edge damage flash
         if self.hurt_flash > 0.01 {
             let ha = (self.hurt_flash * 0.55 * 255.0) as u8;
-            draw_rectangle_lines(0.0, 0.0, sw, sh, 18.0, Color::from_rgba(255, 58, 92, ha));
+            draw_rectangle_lines(0.0, 0.0, vp.sw, vp.sh, 18.0 * s, Color::from_rgba(255, 58, 92, ha));
         }
 
-        // Right: SHARDS, DIFF/FPS, COMBO & OVERDRIVE right-aligned cleanly before Pause button
-        let right_edge = pause_rect.x - 10.0;
-        let shard_sz = if compact { 14.0 } else { 17.0 };
+        // Right: SHARDS, DIFF/FPS, COMBO & OVERDRIVE right-aligned before Pause button
+        let right_edge = pause_rect.x - 12.0;
+        let shard_sz = if compact { 15.0 } else { 18.0 };
         let shard_txt = format!("SHARDS: {}", self.run_shards);
-        let shard_w = draw_right_text(&shard_txt, right_edge, 22.0, shard_sz, gold);
+        let shard_w_phys = draw_right_text(&shard_txt, right_edge * s, 24.0 * s, shard_sz * s, gold);
+        let shard_w = shard_w_phys / s;
         let diff = self.difficulty();
         let meta_right = if diff.id > 0 {
             format!("{} | {} FPS", diff.name, get_fps())
@@ -2632,137 +2836,239 @@ impl Game {
         };
         draw_right_text(
             &meta_right,
-            right_edge,
-            40.0,
-            if compact { 12.0 } else { 14.0 },
+            right_edge * s,
+            43.0 * s,
+            (if compact { 12.5 } else { 14.5 }) * s,
             if diff.id > 0 { diff.color() } else { LIGHTGRAY },
         );
 
-        let mut right_row_y = 56.0;
+        let mut right_row_y = 60.0;
         if self.combo >= 3 {
             let mult = 1.0 + (self.combo as f32 * 0.025).min(1.0);
-            draw_right_text(&format!("COMBO {} ({:.2}x)", self.combo, mult), right_edge, right_row_y, if compact { 12.0 } else { 14.0 }, cyan);
-            right_row_y += 16.0;
+            draw_right_text(
+                &format!("COMBO {} ({:.2}x)", self.combo, mult),
+                right_edge * s,
+                right_row_y * s,
+                (if compact { 13.0 } else { 14.5 }) * s,
+                cyan,
+            );
+            right_row_y += 17.0;
         }
         if self.overdrive_timer > 0.0 {
-            draw_right_text(&format!("OVERDRIVE {:.1}s", self.overdrive_timer), right_edge, right_row_y, if compact { 12.0 } else { 14.0 }, gold);
+            draw_right_text(
+                &format!("OVERDRIVE {:.1}s", self.overdrive_timer),
+                right_edge * s,
+                right_row_y * s,
+                (if compact { 13.0 } else { 14.5 }) * s,
+                gold,
+            );
         }
 
         // Center: WAVE dynamically centered in free gap between Left and Right blocks
-        let left_end = 12.0 + bar_w + 10.0;
-        let right_start = right_edge - shard_w - 10.0;
+        let left_end = sx_pad + bar_w + 12.0;
+        let right_start = right_edge - shard_w - 12.0;
         let free_gap = right_start - left_end;
         let wave_txt = format!("WAVE {}", self.wave);
         let timer_txt = format!("{}s{}", (22.0 - self.wave_timer).ceil().max(1.0) as i32, self.wave_event.tag());
 
-        if free_gap >= 92.0 {
+        if free_gap >= 110.0 {
             let wave_cx = left_end + free_gap * 0.5;
-            draw_centered_text(&wave_txt, wave_cx, 24.0, if compact { 17.0 } else { 21.0 }, pink);
-            draw_centered_text(&timer_txt, wave_cx, 42.0, if compact { 12.0 } else { 14.0 }, LIGHTGRAY);
+            draw_centered_text(&wave_txt, wave_cx * s, 26.0 * s, (if compact { 19.0 } else { 23.0 }) * s, pink);
+            draw_centered_text(&timer_txt, wave_cx * s, 45.0 * s, (if compact { 13.0 } else { 15.0 }) * s, LIGHTGRAY);
         } else {
-            draw_centered_text(&format!("{} | {}", wave_txt, timer_txt), sw * 0.5, lvl_bar_y + 26.0, 15.0, pink);
+            draw_centered_text(&format!("{} | {}", wave_txt, timer_txt), vw * 0.5 * s, (lvl_bar_y + 26.0) * s, 16.0 * s, pink);
         }
 
         // Wave Event / Beacon announcement banner
         if self.banner_timer > 0.0 {
             let alpha = (self.banner_timer / 0.75).clamp(0.0, 1.0);
-            let by = if free_gap >= 92.0 { 64.0 } else { lvl_bar_y + 42.0 };
-            let bw = (sw - 170.0).min(390.0);
-            if bw > 150.0 {
-                let bx = sw * 0.5 - bw * 0.5;
-                draw_rectangle(bx, by, bw, 40.0, Color::from_rgba(6, 12, 24, (0.76 * alpha * 255.0) as u8));
+            let by = if free_gap >= 110.0 { 64.0 } else { lvl_bar_y + 42.0 };
+            let bw = (vw - sx_pad * 2.0 - 150.0).min(430.0);
+            if bw > 160.0 {
+                let bx = vw * 0.5 - bw * 0.5;
+                draw_rectangle(bx * s, by * s, bw * s, 44.0 * s, Color::from_rgba(6, 12, 24, (0.78 * alpha * 255.0) as u8));
                 let mut bc = self.banner_color;
                 bc.a = 0.85 * alpha;
-                draw_rectangle_lines(bx, by, bw, 40.0, 1.5, bc);
+                draw_rectangle_lines(bx * s, by * s, bw * s, 44.0 * s, 1.6 * s, bc);
                 bc.a = alpha;
-                draw_centered_text(&self.banner_text, sw * 0.5, by + 17.0, if compact { 13.0 } else { 15.0 }, bc);
-                draw_centered_text(&self.banner_sub, sw * 0.5, by + 32.0, if compact { 11.0 } else { 12.0 }, Color::from_rgba(226, 232, 240, (alpha * 255.0) as u8));
+                draw_centered_text(&self.banner_text, vw * 0.5 * s, (by + 19.0) * s, (if compact { 14.0 } else { 16.0 }) * s, bc);
+                draw_centered_text(
+                    &self.banner_sub,
+                    vw * 0.5 * s,
+                    (by + 35.0) * s,
+                    (if compact { 11.5 } else { 12.5 }) * s,
+                    Color::from_rgba(226, 232, 240, (alpha * 255.0) as u8),
+                );
             }
         }
 
         // Pause button
-        draw_rectangle(pause_rect.x, pause_rect.y, pause_rect.w, pause_rect.h, Color::from_rgba(10, 16, 30, 220));
-        draw_rectangle_lines(pause_rect.x, pause_rect.y, pause_rect.w, pause_rect.h, 1.5, cyan);
-        draw_centered_text("||", pause_rect.x + pause_rect.w * 0.5, pause_rect.y + pause_rect.h * 0.66, if compact { 16.0 } else { 20.0 }, cyan);
+        draw_rectangle(
+            pause_rect.x * s,
+            pause_rect.y * s,
+            pause_rect.w * s,
+            pause_rect.h * s,
+            Color::from_rgba(10, 16, 30, 225),
+        );
+        draw_rectangle_lines(
+            pause_rect.x * s,
+            pause_rect.y * s,
+            pause_rect.w * s,
+            pause_rect.h * s,
+            1.8 * s,
+            cyan,
+        );
+        draw_centered_text(
+            "||",
+            (pause_rect.x + pause_rect.w * 0.5) * s,
+            (pause_rect.y + pause_rect.h * 0.67) * s,
+            (if compact { 17.0 } else { 20.0 }) * s,
+            cyan,
+        );
 
-        // Compact tactical minimap
-        let map_r = if compact { 26.0 } else { 32.0 };
-        let map_cx = 12.0 + map_r;
-        let map_cy = lvl_bar_y + 20.0 + map_r;
-        draw_circle(map_cx, map_cy, map_r, Color::from_rgba(6, 12, 24, 185));
-        draw_circle_lines(map_cx, map_cy, map_r, 1.5, Color::from_rgba(255, 42, 109, 170));
-        let map_scale = (map_r - 3.0) / ARENA_RADIUS;
+        // Compact tactical minimap (safe-area inset)
+        let map_r = if compact { 30.0 } else { 36.0 };
+        let map_cx = sx_pad + map_r;
+        let map_cy = lvl_bar_y + 22.0 + map_r;
+        draw_circle(map_cx * s, map_cy * s, map_r * s, Color::from_rgba(6, 12, 24, 190));
+        draw_circle_lines(map_cx * s, map_cy * s, map_r * s, 1.6 * s, Color::from_rgba(255, 42, 109, 175));
+        let map_scale = (map_r - 3.5) / ARENA_RADIUS;
         if self.beacon.active {
-            let bmx = map_cx + self.beacon.pos.x * map_scale;
-            let bmy = map_cy + self.beacon.pos.y * map_scale;
-            draw_rectangle(bmx - 2.5, bmy - 2.5, 5.0, 5.0, gold);
+            let bmx = (map_cx + self.beacon.pos.x * map_scale) * s;
+            let bmy = (map_cy + self.beacon.pos.y * map_scale) * s;
+            draw_rectangle(bmx - 2.8 * s, bmy - 2.8 * s, 5.6 * s, 5.6 * s, gold);
         }
         for e in &self.enemies {
             if !e.alive { continue; }
-            let mx = map_cx + e.pos.x * map_scale;
-            let my = map_cy + e.pos.y * map_scale;
-            let c = if e.kind == 3 { purple } else if e.elite { WHITE } else { Color::from_rgba(255, 42, 109, 190) };
-            let dot = if e.kind == 3 { 3.0 } else if e.elite { 2.2 } else { 1.5 };
+            let mx = (map_cx + e.pos.x * map_scale) * s;
+            let my = (map_cy + e.pos.y * map_scale) * s;
+            let c = if e.kind == 3 { purple } else if e.elite { WHITE } else { Color::from_rgba(255, 42, 109, 195) };
+            let dot = (if e.kind == 3 { 3.4 } else if e.elite { 2.5 } else { 1.7 }) * s;
             draw_rectangle(mx - dot * 0.5, my - dot * 0.5, dot, dot, c);
         }
         draw_circle(
-            map_cx + self.player_pos.x * map_scale,
-            map_cy + self.player_pos.y * map_scale,
-            2.5,
+            (map_cx + self.player_pos.x * map_scale) * s,
+            (map_cy + self.player_pos.y * map_scale) * s,
+            2.8 * s,
             if self.overdrive_timer > 0.0 { gold } else { cyan },
         );
 
-        // Dash button
-        let dc = vec2(sw - 58.0, sh - 62.0);
-        let dash_col = if self.dash_cd > 0.0 { Color::from_rgba(70, 90, 120, 180) } else { cyan };
-        draw_circle(dc.x, dc.y, 35.0, Color::from_rgba(5, 217, 232, 25));
-        draw_circle_lines(dc.x, dc.y, 35.0, 2.0, dash_col);
-        draw_centered_text("DASH", dc.x, dc.y - 2.0, 17.0, dash_col);
-        let cd_label = if self.dash_cd > 0.0 { format!("{:.1}s", self.dash_cd) } else { "READY".to_string() };
-        draw_centered_text(&cd_label, dc.x, dc.y + 15.0, 13.0, dash_col);
-
-        // Joysticks
-        if self.left_stick.touch_id.is_none() {
-            draw_circle_lines(86.0, sh - 96.0, 42.0, 2.0, Color::from_rgba(5, 217, 232, 65));
-            draw_circle(86.0, sh - 96.0, 12.0, Color::from_rgba(5, 217, 232, 45));
+        // Enlarged right-side Dash button with radial cooldown arc
+        let dc = self.dash_center(vp);
+        let dash_r = 46.0;
+        let dash_ready = self.dash_cd <= 0.0;
+        let dash_col = if dash_ready { cyan } else { Color::from_rgba(95, 125, 165, 210) };
+        let fill_col = if dash_ready {
+            Color::from_rgba(5, 217, 232, 36)
         } else {
-            draw_circle_lines(self.left_stick.start.x, self.left_stick.start.y, 44.0, 2.0, cyan);
-            draw_circle(self.left_stick.cur.x, self.left_stick.cur.y, 16.0, cyan);
+            Color::from_rgba(8, 14, 28, 185)
+        };
+        draw_circle(dc.x * s, dc.y * s, dash_r * s, fill_col);
+        draw_circle_lines(dc.x * s, dc.y * s, dash_r * s, 2.0 * s, Color::from_rgba(70, 95, 130, 140));
+
+        // Cooldown progress arc (full glowing cyan ring when ready)
+        let progress = if dash_ready {
+            1.0_f32
+        } else {
+            (1.0_f32 - self.dash_cd / self.dash_max_cd.max(0.01)).clamp(0.0, 1.0)
+        };
+        if progress > 0.01 {
+            let segs = 32;
+            let max_a = progress * std::f32::consts::TAU;
+            let start_a = -std::f32::consts::FRAC_PI_2;
+            let arc_r = (dash_r - 2.5) * s;
+            let arc_col = if dash_ready { cyan } else { Color::from_rgba(5, 217, 232, 220) };
+            for i in 0..segs {
+                let a0 = start_a + (i as f32 / segs as f32) * max_a;
+                let a1 = start_a + ((i + 1) as f32 / segs as f32) * max_a;
+                let p0 = vec2(dc.x * s + a0.cos() * arc_r, dc.y * s + a0.sin() * arc_r);
+                let p1 = vec2(dc.x * s + a1.cos() * arc_r, dc.y * s + a1.sin() * arc_r);
+                draw_line(p0.x, p0.y, p1.x, p1.y, (if dash_ready { 4.0 } else { 3.5 }) * s, arc_col);
+            }
+        }
+        if dash_ready {
+            let pulse = (get_time() as f32 * 4.5).sin() * 2.5;
+            draw_circle_lines(
+                dc.x * s,
+                dc.y * s,
+                (dash_r + 5.0 + pulse) * s,
+                1.5 * s,
+                Color::from_rgba(5, 217, 232, 95),
+            );
+        }
+        draw_centered_text("DASH", dc.x * s, (dc.y - 3.0) * s, 19.0 * s, dash_col);
+        let cd_label = if !dash_ready { format!("{:.1}s", self.dash_cd) } else { "READY".to_string() };
+        draw_centered_text(&cd_label, dc.x * s, (dc.y + 17.0) * s, 13.5 * s, dash_col);
+
+        // Dynamic Left Movement Joystick (with subtle resting thumb guide)
+        let rest = self.left_stick_rest(vp);
+        if self.left_stick.touch_id.is_none() {
+            let rc = rest * s;
+            let rr = 48.0 * s;
+            draw_circle(rc.x, rc.y, rr, Color::from_rgba(5, 217, 232, 14));
+            draw_circle_lines(rc.x, rc.y, rr, 2.0 * s, Color::from_rgba(5, 217, 232, 72));
+            draw_circle(rc.x, rc.y, 15.0 * s, Color::from_rgba(5, 217, 232, 48));
+            let tick = Color::from_rgba(5, 217, 232, 65);
+            draw_line(rc.x - rr + 6.0 * s, rc.y, rc.x - rr + 14.0 * s, rc.y, 1.5 * s, tick);
+            draw_line(rc.x + rr - 14.0 * s, rc.y, rc.x + rr - 6.0 * s, rc.y, 1.5 * s, tick);
+            draw_line(rc.x, rc.y - rr + 6.0 * s, rc.x, rc.y - rr + 14.0 * s, 1.5 * s, tick);
+            draw_line(rc.x, rc.y + rr - 14.0 * s, rc.x, rc.y + rr - 6.0 * s, 1.5 * s, tick);
+        } else {
+            let st = self.left_stick.start * s;
+            let cur = self.left_stick.cur * s;
+            draw_circle(st.x, st.y, 52.0 * s, Color::from_rgba(5, 217, 232, 24));
+            draw_circle_lines(st.x, st.y, 52.0 * s, 2.4 * s, cyan);
+            draw_line(st.x, st.y, cur.x, cur.y, 2.5 * s, Color::from_rgba(5, 217, 232, 130));
+            draw_circle(cur.x, cur.y, 20.0 * s, Color::from_rgba(5, 217, 232, 220));
+            draw_circle_lines(cur.x, cur.y, 20.0 * s, 2.0 * s, WHITE);
         }
 
         if self.right_stick.touch_id.is_some() {
-            draw_circle_lines(self.right_stick.start.x, self.right_stick.start.y, 44.0, 2.0, pink);
-            draw_circle(self.right_stick.cur.x, self.right_stick.cur.y, 16.0, pink);
+            let st = self.right_stick.start * s;
+            let cur = self.right_stick.cur * s;
+            draw_circle(st.x, st.y, 52.0 * s, Color::from_rgba(255, 42, 109, 22));
+            draw_circle_lines(st.x, st.y, 52.0 * s, 2.4 * s, pink);
+            draw_line(st.x, st.y, cur.x, cur.y, 2.5 * s, Color::from_rgba(255, 42, 109, 130));
+            draw_circle(cur.x, cur.y, 20.0 * s, Color::from_rgba(255, 42, 109, 220));
         }
     }
 }
 
 fn draw_centered_text(text: &str, cx: f32, y: f32, font_size: f32, color: Color) {
-    let dims = measure_text(text, None, font_size as u16, 1.0);
+    let dims = measure_text(text, None, font_size.max(1.0) as u16, 1.0);
     draw_text(text, cx - dims.width * 0.5, y, font_size, color);
 }
 
 fn draw_right_text(text: &str, rx: f32, y: f32, font_size: f32, color: Color) -> f32 {
-    let dims = measure_text(text, None, font_size as u16, 1.0);
+    let dims = measure_text(text, None, font_size.max(1.0) as u16, 1.0);
     draw_text(text, rx - dims.width, y, font_size, color);
     dims.width
 }
 
-fn ui_button(rect: Rect, label: &str, sub: Option<&str>, border: Color) -> bool {
-    draw_rectangle(rect.x, rect.y, rect.w, rect.h, Color::from_rgba(11, 17, 32, 240));
-    draw_rectangle_lines(rect.x, rect.y, rect.w, rect.h, 2.0, border);
+fn ui_button_v(vrect: Rect, scale: f32, label: &str, sub: Option<&str>, border: Color) -> bool {
+    let rx = vrect.x * scale;
+    let ry = vrect.y * scale;
+    let rw = vrect.w * scale;
+    let rh = vrect.h * scale;
+    draw_rectangle(rx, ry, rw, rh, Color::from_rgba(11, 17, 32, 240));
+    draw_rectangle_lines(rx, ry, rw, rh, 2.0 * scale, border);
     if let Some(sub_txt) = sub {
-        let t_sz = if rect.h < 50.0 { 15.0 } else { 17.0 };
-        let s_sz = if rect.h < 50.0 { 12.0 } else { 13.0 };
-        draw_centered_text(label, rect.x + rect.w * 0.5, rect.y + rect.h * 0.44, t_sz, border);
-        draw_centered_text(sub_txt, rect.x + rect.w * 0.5, rect.y + rect.h * 0.80, s_sz, LIGHTGRAY);
+        let t_sz = (if vrect.h < 50.0 { 15.0 } else { 17.5 }) * scale;
+        let s_sz = (if vrect.h < 50.0 { 12.0 } else { 13.0 }) * scale;
+        draw_centered_text(label, rx + rw * 0.5, ry + rh * 0.44, t_sz, border);
+        draw_centered_text(sub_txt, rx + rw * 0.5, ry + rh * 0.80, s_sz, LIGHTGRAY);
     } else {
-        let f_sz = if rect.h < 40.0 { 16.0 } else { 19.0 };
-        draw_centered_text(label, rect.x + rect.w * 0.5, rect.y + rect.h * 0.5 + 6.0, f_sz, border);
+        let f_sz = (if vrect.h < 40.0 { 15.5 } else { 19.0 }) * scale;
+        draw_centered_text(label, rx + rw * 0.5, ry + rh * 0.5 + 6.0 * scale, f_sz, border);
     }
-    if is_mouse_button_pressed(MouseButton::Left) {
+    for touch in touches() {
+        if touch.phase == TouchPhase::Started && vrect.contains(touch.position / scale) {
+            return true;
+        }
+    }
+    if touches().is_empty() && is_mouse_button_pressed(MouseButton::Left) {
         let (mx, my) = mouse_position();
-        return rect.contains(vec2(mx, my));
+        return vrect.contains(vec2(mx / scale, my / scale));
     }
     false
 }
@@ -2790,10 +3096,13 @@ async fn main() {
     loop {
         let sw = screen_width();
         let sh = screen_height();
+        let focus_lost = ANDROID_PAUSE_REQUESTED.swap(false, Ordering::SeqCst);
+
         if !sw.is_finite() || !sh.is_finite() || sw < 16.0 || sh < 16.0 {
             if game.state == ScreenState::Playing {
                 game.left_stick = Stick::new();
                 game.right_stick = Stick::new();
+                game.state = ScreenState::Paused;
             }
             next_frame().await;
             continue;
@@ -2805,12 +3114,23 @@ async fn main() {
         }
 
         let raw_dt = get_frame_time();
+        if (focus_lost || (raw_dt.is_finite() && raw_dt > 0.35)) && game.state == ScreenState::Playing {
+            game.left_stick = Stick::new();
+            game.right_stick = Stick::new();
+            game.state = ScreenState::Paused;
+        }
+
         let dt = if raw_dt.is_finite() { raw_dt.clamp(0.0, 0.05) } else { 0.0 };
         clear_background(Color::from_rgba(4, 6, 11, 255));
 
+        let vp = Viewport::current();
+        let s = vp.scale;
+        let vw = vp.vw;
+        let vh = vp.vh;
+
         match game.state {
             ScreenState::Menu => {
-                let compact = sw < 600.0 || sh < 520.0;
+                let compact = vw < 720.0 || vh < 500.0;
                 let purple = Color::from_rgba(184, 41, 234, 255);
                 let base_badge = if cfg!(feature = "demo") {
                     "RUST WASM DEMO (MAX WAVE 8)"
@@ -2822,22 +3142,22 @@ async fn main() {
                 } else {
                     base_badge.to_string()
                 };
-                draw_centered_text(&badge, sw * 0.5, if compact { 22.0 } else { 28.0 }, if compact { 12.0 } else { 14.0 }, pink);
-                draw_centered_text("NEON CORE", sw * 0.5, if compact { 50.0 } else { 62.0 }, if compact { 30.0 } else { 38.0 }, cyan);
+                draw_centered_text(&badge, vw * 0.5 * s, (if compact { 20.0 } else { 24.0 }) * s, (if compact { 12.0 } else { 13.5 }) * s, pink);
+                draw_centered_text("NEON CORE", vw * 0.5 * s, (if compact { 46.0 } else { 56.0 }) * s, (if compact { 30.0 } else { 36.0 }) * s, cyan);
                 let sub_hdr = if game.meta.best_wave > 0 {
                     format!("SHARDS: {}  |  REKORD: FALA {} ({} KILLS)", game.meta.shards, game.meta.best_wave, game.meta.best_kills)
                 } else {
                     format!("SHARDS: {}", game.meta.shards)
                 };
-                draw_centered_text(&sub_hdr, sw * 0.5, if compact { 70.0 } else { 84.0 }, if compact { 14.0 } else { 16.0 }, gold);
+                draw_centered_text(&sub_hdr, vw * 0.5 * s, (if compact { 66.0 } else { 77.0 }) * s, (if compact { 14.0 } else { 15.5 }) * s, gold);
 
                 // 4 Hangar tabs: BOJOWE | SURVIVAL | ENDGAME | STATKI
-                let tab_y = if compact { 80.0 } else { 96.0 };
-                let tab_gap = 6.0;
-                let total_tab_w = (sw - 24.0).min(580.0);
+                let tab_y = if compact { 76.0 } else { 88.0 };
+                let tab_gap = 8.0;
+                let total_tab_w = (vw - vp.safe_x * 2.0).min(640.0);
                 let tab_w = (total_tab_w - tab_gap * 3.0) / 4.0;
-                let tab_h = if compact { 28.0 } else { 32.0 };
-                let tab_start_x = sw * 0.5 - total_tab_w * 0.5;
+                let tab_h = if compact { 30.0 } else { 34.0 };
+                let tab_start_x = vw * 0.5 - total_tab_w * 0.5;
                 let tab_defs: [(u8, &str, Color); 4] = [
                     (0, if compact { "BOJOWE" } else { "BOJOWE (5)" }, cyan),
                     (1, if compact { "SURVIVAL" } else { "SURVIVAL (5)" }, green),
@@ -2847,26 +3167,30 @@ async fn main() {
                 for (t_idx, (tid, lbl, col)) in tab_defs.iter().enumerate() {
                     let rx = tab_start_x + t_idx as f32 * (tab_w + tab_gap);
                     let active = game.shop_tab == *tid;
-                    if ui_button(Rect::new(rx, tab_y, tab_w, tab_h), lbl, None, if active { *col } else { slate }) {
+                    if ui_button_v(Rect::new(rx, tab_y, tab_w, tab_h), s, lbl, None, if active { *col } else { slate }) {
                         game.shop_tab = *tid;
                     }
                 }
 
-                let cols = if sw >= 580.0 { 2 } else { 1 };
-                let start_y = tab_y + tab_h + if compact { 8.0 } else { 11.0 };
+                let cols = if vw >= 620.0 { 2 } else { 1 };
+                let start_y = tab_y + tab_h + 10.0;
                 let active_tab = game.shop_tab;
                 let cards_end_y: f32;
 
                 if active_tab == 3 {
-                    let card_w = if cols == 2 { ((sw - 48.0) * 0.5).min(285.0) } else { (sw - 24.0).min(360.0) };
-                    let card_h = if compact { 48.0 } else { 62.0 };
-                    let gap_y = if compact { 6.0 } else { 9.0 };
-                    let start_x = sw * 0.5 - (cols as f32 * card_w + (cols - 1) as f32 * 10.0) * 0.5;
+                    let card_w = if cols == 2 {
+                        ((vw - vp.safe_x * 2.0 - 12.0) * 0.5).min(340.0)
+                    } else {
+                        (vw - vp.safe_x * 2.0).min(400.0)
+                    };
+                    let card_h = if compact { 58.0 } else { 70.0 };
+                    let gap_y = 10.0;
+                    let start_x = vw * 0.5 - (cols as f32 * card_w + (cols - 1) as f32 * 12.0) * 0.5;
 
                     for (i, ship) in SHIPS.iter().enumerate() {
                         let r = i / cols;
                         let c = i % cols;
-                        let rx = start_x + c as f32 * (card_w + 10.0);
+                        let rx = start_x + c as f32 * (card_w + 12.0);
                         let ry = start_y + r as f32 * (card_h + gap_y);
 
                         let unlocked = (game.meta.unlocked_ships_mask & (1u32 << ship.id)) != 0;
@@ -2889,7 +3213,7 @@ async fn main() {
                             format!("{} [{} SHARDS]", ship.name, ship.cost)
                         };
 
-                        if ui_button(Rect::new(rx, ry, card_w, card_h), &title, Some(ship.perk), border) {
+                        if ui_button_v(Rect::new(rx, ry, card_w, card_h), s, &title, Some(ship.perk), border) {
                             if unlocked {
                                 game.meta.selected_ship = ship.id;
                                 game.meta.save();
@@ -2906,17 +3230,21 @@ async fn main() {
                     let rows = (SHIPS.len() + cols - 1) / cols;
                     cards_end_y = start_y + rows as f32 * (card_h + gap_y);
                 } else {
-                    let card_w = if cols == 2 { ((sw - 48.0) * 0.5).min(285.0) } else { (sw - 24.0).min(360.0) };
-                    let card_h = if compact { 40.0 } else { 48.0 };
-                    let gap_y = if compact { 5.0 } else { 8.0 };
-                    let start_x = sw * 0.5 - (cols as f32 * card_w + (cols - 1) as f32 * 10.0) * 0.5;
+                    let card_w = if cols == 2 {
+                        ((vw - vp.safe_x * 2.0 - 12.0) * 0.5).min(340.0)
+                    } else {
+                        (vw - vp.safe_x * 2.0).min(400.0)
+                    };
+                    let card_h = if compact { 46.0 } else { 54.0 };
+                    let gap_y = 8.0;
+                    let start_x = vw * 0.5 - (cols as f32 * card_w + (cols - 1) as f32 * 12.0) * 0.5;
 
                     let mut visible_idx = 0usize;
                     for item in SHOP_ITEMS.iter().filter(|it| it.tab == active_tab) {
                         let r = visible_idx / cols;
                         let c = visible_idx % cols;
                         let is_last_odd = cols == 2 && visible_idx == 4;
-                        let rx = if is_last_odd { sw * 0.5 - card_w * 0.5 } else { start_x + c as f32 * (card_w + 10.0) };
+                        let rx = if is_last_odd { vw * 0.5 - card_w * 0.5 } else { start_x + c as f32 * (card_w + 12.0) };
                         let ry = start_y + r as f32 * (card_h + gap_y);
                         visible_idx += 1;
 
@@ -2940,7 +3268,7 @@ async fn main() {
                             format!("{} | {} SHARDS", item.bonus, cost)
                         };
 
-                        if ui_button(Rect::new(rx, ry, card_w, card_h), &title, Some(&sub), border) && can_buy {
+                        if ui_button_v(Rect::new(rx, ry, card_w, card_h), s, &title, Some(&sub), border) && can_buy {
                             game.meta.shards -= cost;
                             game.meta.inc_lvl(item.id);
                             game.meta.save();
@@ -2952,32 +3280,32 @@ async fn main() {
                 }
 
                 // Difficulty selector row
-                let diff_y = cards_end_y + if compact { 4.0 } else { 8.0 };
-                let diff_gap = 6.0;
-                let diff_total_w = (sw - 24.0).min(480.0);
+                let diff_y = (cards_end_y + 6.0).min(vh - 104.0);
+                let diff_gap = 8.0;
+                let diff_total_w = (vw - vp.safe_x * 2.0).min(560.0);
                 let diff_w = (diff_total_w - diff_gap * 2.0) / 3.0;
-                let diff_h = if compact { 28.0 } else { 34.0 };
-                let diff_start_x = sw * 0.5 - diff_total_w * 0.5;
+                let diff_h = 34.0;
+                let diff_start_x = vw * 0.5 - diff_total_w * 0.5;
                 for (d_idx, df) in DIFFICULTIES.iter().enumerate() {
                     let active = game.meta.difficulty == df.id;
                     let rx = diff_start_x + d_idx as f32 * (diff_w + diff_gap);
-                    if ui_button(Rect::new(rx, diff_y, diff_w, diff_h), df.short_tag, None, if active { df.color() } else { slate }) {
+                    if ui_button_v(Rect::new(rx, diff_y, diff_w, diff_h), s, df.short_tag, None, if active { df.color() } else { slate }) {
                         game.meta.difficulty = df.id;
                         game.meta.save();
                     }
                 }
 
                 // Bottom action row
-                let btn_y = diff_y + diff_h + if compact { 7.0 } else { 10.0 };
-                let btn_w = ((sw - 34.0) * 0.5).min(185.0);
-                let btn_h = if compact { 38.0 } else { 44.0 };
+                let btn_y = (diff_y + diff_h + 10.0).min(vh - 58.0);
+                let btn_w = ((vw - vp.safe_x * 2.0 - 16.0) * 0.5).min(220.0);
+                let btn_h = 46.0;
                 let active_ship = game.selected_ship();
                 let start_lbl = format!("START: {}", active_ship.short_name);
 
-                if ui_button(Rect::new(sw * 0.5 - btn_w - 6.0, btn_y, btn_w, btn_h), &start_lbl, None, active_ship.color()) {
+                if ui_button_v(Rect::new(vw * 0.5 - btn_w - 8.0, btn_y, btn_w, btn_h), s, &start_lbl, None, active_ship.color()) {
                     game.start_run();
                 }
-                if ui_button(Rect::new(sw * 0.5 + 6.0, btn_y, btn_w, btn_h), "OPCJE", None, gold) {
+                if ui_button_v(Rect::new(vw * 0.5 + 8.0, btn_y, btn_w, btn_h), s, "OPCJE", None, gold) {
                     game.prev_state = ScreenState::Menu;
                     game.state = ScreenState::Settings;
                 }
@@ -2991,57 +3319,60 @@ async fn main() {
             }
             ScreenState::Paused => {
                 game.render_world();
-                draw_rectangle(0.0, 0.0, sw, sh, Color::from_rgba(4, 6, 11, 210));
-                draw_centered_text("PAUZA", sw * 0.5, sh * 0.28, 38.0, cyan);
-                if ui_button(Rect::new(sw * 0.5 - 120.0, sh * 0.38, 240.0, 48.0), "WZNOW", None, cyan) {
+                draw_rectangle(0.0, 0.0, vp.sw, vp.sh, Color::from_rgba(4, 6, 11, 210));
+                draw_centered_text("PAUZA", vw * 0.5 * s, vh * 0.25 * s, 38.0 * s, cyan);
+                let bw = 270.0;
+                let bx = vw * 0.5 - bw * 0.5;
+                let by = vh * 0.36;
+                if ui_button_v(Rect::new(bx, by, bw, 52.0), s, "WZNOW", None, cyan) {
                     game.state = ScreenState::Playing;
                 }
-                if ui_button(Rect::new(sw * 0.5 - 120.0, sh * 0.38 + 60.0, 240.0, 48.0), "OPCJE", None, gold) {
+                if ui_button_v(Rect::new(bx, by + 66.0, bw, 52.0), s, "OPCJE", None, gold) {
                     game.prev_state = ScreenState::Paused;
                     game.state = ScreenState::Settings;
                 }
-                if ui_button(Rect::new(sw * 0.5 - 120.0, sh * 0.38 + 120.0, 240.0, 48.0), "PRZERWIJ LOT", None, pink) {
+                if ui_button_v(Rect::new(bx, by + 132.0, bw, 52.0), s, "PRZERWIJ LOT", None, pink) {
                     game.finish_run(false);
                 }
             }
             ScreenState::Settings => {
-                draw_centered_text("OPCJE SYSTEMU", sw * 0.5, 65.0, 32.0, cyan);
-                let bw = (sw - 40.0).min(320.0);
-                let bx = sw * 0.5 - bw * 0.5;
+                draw_centered_text("OPCJE SYSTEMU", vw * 0.5 * s, 56.0 * s, 32.0 * s, cyan);
+                let bw = (vw - vp.safe_x * 2.0).min(380.0);
+                let bx = vw * 0.5 - bw * 0.5;
 
                 let s_lbl = if game.settings.sound { "DZWIEK: WLACZONY" } else { "DZWIEK: WYLACZONY" };
-                if ui_button(Rect::new(bx, 105.0, bw, 44.0), s_lbl, None, cyan) {
+                if ui_button_v(Rect::new(bx, 92.0, bw, 48.0), s, s_lbl, None, cyan) {
                     game.settings.sound = !game.settings.sound;
                 }
                 let sh_lbl = if game.settings.shake { "SHAKE: WLACZONY" } else { "SHAKE: WYLACZONY" };
-                if ui_button(Rect::new(bx, 158.0, bw, 44.0), sh_lbl, None, cyan) {
+                if ui_button_v(Rect::new(bx, 150.0, bw, 48.0), s, sh_lbl, None, cyan) {
                     game.settings.shake = !game.settings.shake;
                 }
                 let dm_lbl = if game.settings.dmg_nums { "OBRAZENIA: WLACZONE" } else { "OBRAZENIA: WYLACZONE" };
-                if ui_button(Rect::new(bx, 211.0, bw, 44.0), dm_lbl, None, cyan) {
+                if ui_button_v(Rect::new(bx, 208.0, bw, 48.0), s, dm_lbl, None, cyan) {
                     game.settings.dmg_nums = !game.settings.dmg_nums;
                 }
                 let st_lbl = if game.settings.fixed_stick { "DRAZEK: STALY" } else { "DRAZEK: PLYWAJACY" };
-                if ui_button(Rect::new(bx, 264.0, bw, 44.0), st_lbl, None, cyan) {
+                if ui_button_v(Rect::new(bx, 266.0, bw, 48.0), s, st_lbl, None, cyan) {
                     game.settings.fixed_stick = !game.settings.fixed_stick;
                 }
                 let ai_lbl = if game.settings.auto_aim { "AUTO-AIM: WLACZONY" } else { "AUTO-AIM: WYLACZONY" };
-                if ui_button(Rect::new(bx, 317.0, bw, 44.0), ai_lbl, None, cyan) {
+                if ui_button_v(Rect::new(bx, 324.0, bw, 48.0), s, ai_lbl, None, cyan) {
                     game.settings.auto_aim = !game.settings.auto_aim;
                 }
-                if ui_button(Rect::new(bx, 378.0, bw, 48.0), "WROC", None, gold) {
+                if ui_button_v(Rect::new(bx, 392.0, bw, 52.0), s, "WROC", None, gold) {
                     game.state = game.prev_state;
                 }
             }
             ScreenState::LevelUp => {
                 game.render_world();
-                draw_rectangle(0.0, 0.0, sw, sh, Color::from_rgba(4, 6, 11, 215));
-                draw_centered_text("OVERCLOCK RDZENIA", sw * 0.5, 65.0, 30.0, cyan);
-                let cw = (sw - 40.0).min(340.0);
+                draw_rectangle(0.0, 0.0, vp.sw, vp.sh, Color::from_rgba(4, 6, 11, 215));
+                draw_centered_text("OVERCLOCK RDZENIA", vw * 0.5 * s, 68.0 * s, 32.0 * s, cyan);
+                let cw = (vw - vp.safe_x * 2.0).min(420.0);
                 let choices = game.level_choices;
                 for (i, opt) in choices.iter().enumerate() {
-                    let rect = Rect::new(sw * 0.5 - cw * 0.5, 105.0 + i as f32 * 74.0, cw, 62.0);
-                    if ui_button(rect, opt.title, Some(opt.desc), cyan) {
+                    let rect = Rect::new(vw * 0.5 - cw * 0.5, 110.0 + i as f32 * 86.0, cw, 72.0);
+                    if ui_button_v(rect, s, opt.title, Some(opt.desc), cyan) {
                         game.apply_upgrade(opt.id);
                         break;
                     }
@@ -3051,40 +3382,40 @@ async fn main() {
                 let title = if victory { "SEKTOR DEMO OCZYSZCZONY" } else { "RDZEN ZNISZCZONY" };
                 let diff = game.difficulty();
                 let ship = game.selected_ship();
-                draw_centered_text(title, sw * 0.5, sh * 0.26, 32.0, if victory { cyan } else { pink });
+                draw_centered_text(title, vw * 0.5 * s, vh * 0.22 * s, 34.0 * s, if victory { cyan } else { pink });
                 draw_centered_text(
                     &format!("{}  |  {} ({:.1}x)", ship.name, diff.name, diff.shard_mult),
-                    sw * 0.5,
-                    sh * 0.26 + 32.0,
-                    16.0,
+                    vw * 0.5 * s,
+                    (vh * 0.22 + 34.0) * s,
+                    17.0 * s,
                     diff.color(),
                 );
                 if game.is_new_record {
-                    draw_centered_text("* NOWY REKORD OSOBISTY! *", sw * 0.5, sh * 0.26 + 58.0, 18.0, gold);
+                    draw_centered_text("* NOWY REKORD OSOBISTY! *", vw * 0.5 * s, (vh * 0.22 + 62.0) * s, 19.0 * s, gold);
                 }
-                let stat_y = sh * 0.26 + if game.is_new_record { 90.0 } else { 70.0 };
+                let stat_y = vh * 0.22 + if game.is_new_record { 96.0 } else { 76.0 };
                 draw_centered_text(
                     &format!("FALA: {}  |  POZIOM: {}", game.wave, game.level),
-                    sw * 0.5,
-                    stat_y,
-                    20.0,
+                    vw * 0.5 * s,
+                    stat_y * s,
+                    22.0 * s,
                     WHITE,
                 );
                 draw_centered_text(
                     &format!("ZNISZCZENI: {}  |  SHARDS: +{}", game.kills, game.run_shards),
-                    sw * 0.5,
-                    stat_y + 30.0,
-                    20.0,
+                    vw * 0.5 * s,
+                    (stat_y + 32.0) * s,
+                    22.0 * s,
                     gold,
                 );
                 draw_centered_text(
                     &format!("NAJLEPSZA FALA: {}  |  REKORD KILLS: {}", game.meta.best_wave, game.meta.best_kills),
-                    sw * 0.5,
-                    stat_y + 56.0,
-                    15.0,
+                    vw * 0.5 * s,
+                    (stat_y + 62.0) * s,
+                    16.0 * s,
                     LIGHTGRAY,
                 );
-                if ui_button(Rect::new(sw * 0.5 - 135.0, stat_y + 80.0, 270.0, 50.0), "POWROT DO HANGARU", None, cyan) {
+                if ui_button_v(Rect::new(vw * 0.5 - 150.0, stat_y + 92.0, 300.0, 54.0), s, "POWROT DO HANGARU", None, cyan) {
                     game.state = ScreenState::Menu;
                 }
             }
