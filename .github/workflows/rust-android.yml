@@ -3,6 +3,7 @@ name: CI, Validation & Cross-Platform Release Builds
 on:
   push:
     branches: [ main, "refactor/**" ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ main ]
   workflow_dispatch:
@@ -237,11 +238,71 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --release
-          test -x target/release/neon_core
+          cp target/release/neon_core neon_core-linux-x86_64
+          chmod +x neon_core-linux-x86_64
 
       - name: Upload Native Desktop Binary
         uses: actions/upload-artifact@v7
         with:
           name: neon-core-linux-x86_64
-          path: target/release/neon_core
+          path: neon_core-linux-x86_64
           if-no-files-found: error
+
+  build-windows:
+    name: Build Native Windows Binary (x86_64)
+    needs: validate
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and Windows release target
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/release/
+          key: ${{ runner.os }}-cargo-windows-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-windows-
+
+      - name: Build Native Windows Release
+        shell: pwsh
+        run: |
+          cargo build --release
+          Copy-Item target/release/neon_core.exe neon_core-windows-x86_64.exe
+
+      - name: Upload Native Windows Binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: neon-core-windows-x86_64
+          path: neon_core-windows-x86_64.exe
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [ build-android, build-wasm, build-desktop, build-windows ]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+
+      - name: Publish Release Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/**/*.apk
+            artifacts/**/*.zip
+            artifacts/**/neon_core-linux-x86_64
+            artifacts/**/*.exe
