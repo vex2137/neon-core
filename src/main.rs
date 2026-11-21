@@ -863,11 +863,11 @@ impl Game {
         self.wave = 1;
         self.wave_timer = 0.0;
         self.wave_event = WaveEvent::Normal;
-        self.banner_text = format!("FALA 1 — {} [{}]", ship.name, diff.name);
+        self.banner_text = format!("FALA 1 - {} [{}]", ship.name, diff.name);
         self.banner_sub = if diff.id == 0 {
             "ZBIERAJ PRZEKAZNIKI I UNIKAJ OGNIA".to_string()
         } else {
-            format!("MNOZNIK SHARDOW {:.1}x — EKSTREMALNE ZAGROZENIE", diff.shard_mult)
+            format!("MNOZNIK SHARDOW {:.1}x - EKSTREMALNE ZAGROZENIE", diff.shard_mult)
         };
         self.banner_timer = 3.2;
         self.banner_color = diff.color();
@@ -1942,11 +1942,11 @@ impl Game {
             } else {
                 1
             };
-            self.banner_text = format!("FALA {} — ALARM: OVERLORD BOSS x{}!", w, boss_cnt);
+            self.banner_text = format!("FALA {} - ALARM: OVERLORD BOSS x{}!", w, boss_cnt);
             self.banner_sub = if boss_cnt >= 2 {
                 "WIELU BOSSOW + ESKORTA SNAJPEROW".to_string()
             } else {
-                "UNIKAJ FAL POCISKOW — DASH DAJE NIESMIERTELNOSC".to_string()
+                "UNIKAJ FAL POCISKOW - DASH DAJE NIESMIERTELNOSC".to_string()
             };
             self.banner_color = Color::from_rgba(184, 41, 234, 255);
             for _ in 0..boss_cnt {
@@ -1973,7 +1973,7 @@ impl Game {
             self.wave_event = ev;
             match ev {
                 WaveEvent::Swarm => {
-                    self.banner_text = format!("FALA {} — ROJ ZASADZKI!", w);
+                    self.banner_text = format!("FALA {} - ROJ ZASADZKI!", w);
                     self.banner_sub = "OTACZAJA CIE SZYBKIE JEDNOSTKI".to_string();
                     self.banner_color = Color::from_rgba(255, 123, 0, 255);
                     let ring_cnt = (9 + w).min(20);
@@ -1989,13 +1989,13 @@ impl Game {
                     }
                 }
                 WaveEvent::Orbital => {
-                    self.banner_text = format!("FALA {} — OSTRZAL ORBITALNY!", w);
+                    self.banner_text = format!("FALA {} - OSTRZAL ORBITALNY!", w);
                     self.banner_sub = "UCIEKAJ Z CZERWONYCH STREF UDERZENIA".to_string();
                     self.banner_color = Color::from_rgba(255, 58, 92, 255);
                     self.hazard_spawn_timer = 0.55;
                 }
                 WaveEvent::Sniper => {
-                    self.banner_text = format!("FALA {} — ESKADRA SNAJPEROW!", w);
+                    self.banner_text = format!("FALA {} - ESKADRA SNAJPEROW!", w);
                     self.banner_sub = "UWAGA NA LASERY NAMIERZAJACE I WIRY".to_string();
                     self.banner_color = Color::from_rgba(125, 110, 255, 255);
                     for k in 0..(4 + w / 2) {
@@ -2003,8 +2003,8 @@ impl Game {
                     }
                 }
                 _ => {
-                    self.banner_text = format!("FALA {} — FALA BOMBOWCOW!", w);
-                    self.banner_sub = "NISZCZ Z DYSTANSU — EKSPLODUJA ODLAMKAMI".to_string();
+                    self.banner_text = format!("FALA {} - FALA BOMBOWCOW!", w);
+                    self.banner_sub = "NISZCZ Z DYSTANSU - EKSPLODUJA ODLAMKAMI".to_string();
                     self.banner_color = Color::from_rgba(170, 255, 45, 255);
                     for _ in 0..(5 + w / 2) {
                         self.spawn_enemy(5);
@@ -2035,7 +2035,7 @@ impl Game {
         };
         if self.banner_timer <= 0.4 {
             self.banner_text = "PRZEKAZNIK MOCY AKTYWNY".to_string();
-            self.banner_sub = "PRZEJMIJ ZLOTY PUNKT NA RADARZE — OVERDRIVE + SHARDS".to_string();
+            self.banner_sub = "PRZEJMIJ ZLOTY PUNKT NA RADARZE - OVERDRIVE + SHARDS".to_string();
             self.banner_color = Color::from_rgba(249, 200, 14, 255);
             self.banner_timer = 3.0;
         }
@@ -2594,7 +2594,7 @@ impl Game {
         let shard_w = draw_right_text(&shard_txt, right_edge, 22.0, shard_sz, gold);
         let diff = self.difficulty();
         let meta_right = if diff.id > 0 {
-            format!("{} • {} FPS", diff.name, get_fps())
+            format!("{} | {} FPS", diff.name, get_fps())
         } else {
             format!("{} FPS", get_fps())
         };
@@ -2628,7 +2628,7 @@ impl Game {
             draw_centered_text(&wave_txt, wave_cx, 24.0, if compact { 17.0 } else { 21.0 }, pink);
             draw_centered_text(&timer_txt, wave_cx, 42.0, if compact { 12.0 } else { 14.0 }, LIGHTGRAY);
         } else {
-            draw_centered_text(&format!("{} • {}", wave_txt, timer_txt), sw * 0.5, lvl_bar_y + 26.0, 15.0, pink);
+            draw_centered_text(&format!("{} | {}", wave_txt, timer_txt), sw * 0.5, lvl_bar_y + 26.0, 15.0, pink);
         }
 
         // Wave Event / Beacon announcement banner
@@ -2768,17 +2768,17 @@ async fn main() {
                 let base_badge = if cfg!(feature = "demo") {
                     "RUST WASM DEMO (MAX WAVE 8)"
                 } else {
-                    "NATIVE RUST ARM64 • HANGAR & SKLEP"
+                    "NATIVE RUST ARM64 | HANGAR & SKLEP"
                 };
                 let badge = if game.meta.prestige_lvl > 0 {
-                    format!("{}  •  PRESTIZ ★{}", base_badge, game.meta.prestige_lvl)
+                    format!("{}  |  PRESTIZ *{}", base_badge, game.meta.prestige_lvl)
                 } else {
                     base_badge.to_string()
                 };
                 draw_centered_text(&badge, sw * 0.5, if compact { 22.0 } else { 28.0 }, if compact { 12.0 } else { 14.0 }, pink);
                 draw_centered_text("NEON CORE", sw * 0.5, if compact { 50.0 } else { 62.0 }, if compact { 30.0 } else { 38.0 }, cyan);
                 let sub_hdr = if game.meta.best_wave > 0 {
-                    format!("SHARDS: {}  •  REKORD: FALA {} ({} KILLS)", game.meta.shards, game.meta.best_wave, game.meta.best_kills)
+                    format!("SHARDS: {}  |  REKORD: FALA {} ({} KILLS)", game.meta.shards, game.meta.best_wave, game.meta.best_kills)
                 } else {
                     format!("SHARDS: {}", game.meta.shards)
                 };
@@ -2888,9 +2888,9 @@ async fn main() {
                             format!("{} [{}/{}]", item.name, lvl, item.max_lvl)
                         };
                         let sub = if maxed {
-                            format!("{} • MAKSIMUM", item.bonus)
+                            format!("{} | MAKSIMUM", item.bonus)
                         } else {
-                            format!("{} • {} SHARDS", item.bonus, cost)
+                            format!("{} | {} SHARDS", item.bonus, cost)
                         };
 
                         if ui_button(Rect::new(rx, ry, card_w, card_h), &title, Some(&sub), border) && can_buy {
@@ -3004,14 +3004,14 @@ async fn main() {
                 let ship = game.selected_ship();
                 draw_centered_text(title, sw * 0.5, sh * 0.26, 32.0, if victory { cyan } else { pink });
                 draw_centered_text(
-                    &format!("{}  •  {} ({:.1}x)", ship.name, diff.name, diff.shard_mult),
+                    &format!("{}  |  {} ({:.1}x)", ship.name, diff.name, diff.shard_mult),
                     sw * 0.5,
                     sh * 0.26 + 32.0,
                     16.0,
                     diff.color(),
                 );
                 if game.is_new_record {
-                    draw_centered_text("★ NOWY REKORD OSOBISTY! ★", sw * 0.5, sh * 0.26 + 58.0, 18.0, gold);
+                    draw_centered_text("* NOWY REKORD OSOBISTY! *", sw * 0.5, sh * 0.26 + 58.0, 18.0, gold);
                 }
                 let stat_y = sh * 0.26 + if game.is_new_record { 90.0 } else { 70.0 };
                 draw_centered_text(
