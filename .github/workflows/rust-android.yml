@@ -1,0 +1,107 @@
+name: Build Native Android APK & WASM Demo
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17 (for Android SDK manager)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install Rust & Android Targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,wasm32-unknown-unknown
+
+      - name: Install Android SDK Platform 30, Build-Tools 29.0.3 & NDK r25
+        run: |
+          (yes || true) | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null
+          (yes || true) | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-30" "build-tools;29.0.3" "ndk;25.2.9519653"
+          # Keep only build-tools 29.0.3 so cargo-quad-apk doesn't pick 31+ (which removed dx)
+          find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 ! -name "29.0.3" -exec sudo rm -rf {} +
+
+      - name: Setup Java 8 (for cargo-quad-apk rt.jar)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '8'
+
+      - name: Install cargo-quad-apk
+        run: cargo install --locked cargo-quad-apk
+
+      - name: Build Native Android APK (Release)
+        run: |
+          export NDK_HOME="$ANDROID_HOME/ndk/25.2.9519653"
+          export ANDROID_NDK_HOME="$NDK_HOME"
+          TOOLCHAIN="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+          BIN_DIR="$TOOLCHAIN/bin"
+          SYSROOT_LIB="$TOOLCHAIN/sysroot/usr/lib"
+
+          for arch in arm-linux-androideabi aarch64-linux-android i686-linux-android x86_64-linux-android; do
+            ln -sf "$BIN_DIR/llvm-ar" "$BIN_DIR/${arch}-ar"
+            ln -sf "$BIN_DIR/llvm-ranlib" "$BIN_DIR/${arch}-ranlib"
+            ln -sf "$BIN_DIR/ld.lld" "$BIN_DIR/${arch}-ld"
+            ln -sf "$BIN_DIR/llvm-readelf" "$BIN_DIR/${arch}-readelf"
+            ln -sf "$BIN_DIR/llvm-objdump" "$BIN_DIR/${arch}-objdump"
+            ln -sf "$BIN_DIR/llvm-strip" "$BIN_DIR/${arch}-strip"
+            ln -sf "$BIN_DIR/llvm-nm" "$BIN_DIR/${arch}-nm"
+          done
+
+          ARM_UNWIND="$(find "$TOOLCHAIN" -path "*/linux/arm/libunwind.a" | head -n 1)"
+          AARCH64_UNWIND="$(find "$TOOLCHAIN" -path "*/linux/aarch64/libunwind.a" | head -n 1)"
+          if [ -n "$ARM_UNWIND" ]; then
+            cp -f "$ARM_UNWIND" "$SYSROOT_LIB/arm-linux-androideabi/libunwind.a"
+            echo "INPUT(-lunwind)" > "$SYSROOT_LIB/arm-linux-androideabi/libgcc.a"
+          fi
+          if [ -n "$AARCH64_UNWIND" ]; then
+            cp -f "$AARCH64_UNWIND" "$SYSROOT_LIB/aarch64-linux-android/libunwind.a"
+            echo "INPUT(-lunwind)" > "$SYSROOT_LIB/aarch64-linux-android/libgcc.a"
+          fi
+
+          cargo quad-apk build --release
+
+      - name: Upload Native Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-core-rust-android-apk
+          path: target/android-artifacts/**/*.apk
+
+      - name: Build WASM Web Demo (itch.io)
+        run: |
+          cargo build --release --target wasm32-unknown-unknown --features demo
+          mkdir -p web-demo
+          cp target/wasm32-unknown-unknown/release/neon-core.wasm web-demo/
+          curl -sL https://not-fl3.github.io/miniquad-samples/mq_js_bundle.js -o web-demo/mq_js_bundle.js
+          cat << 'IDX' > web-demo/index.html
+          <!doctype html>
+          <html lang="pl">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+            <title>NEON CORE [RUST WASM DEMO]</title>
+            <style>html, body, canvas { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #04060b; touch-action: none; }</style>
+          </head>
+          <body>
+            <canvas id="glcanvas" tabindex="1"></canvas>
+            <script src="mq_js_bundle.js"></script>
+            <script>load("neon-core.wasm");</script>
+          </body>
+          </html>
+          IDX
+          cd web-demo && zip -r ../neon-core-rust-wasm-demo.zip .
+
+      - name: Upload WASM Web Demo
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-core-rust-wasm-demo
+          path: neon-core-rust-wasm-demo.zip
