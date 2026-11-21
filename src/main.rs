@@ -2427,7 +2427,7 @@ impl Game {
         let vmin_y = cam_rect.y - 60.0;
         let vmax_y = cam_rect.y + vh + 60.0;
 
-        set_camera(&Camera2D::from_display_rect(cam_rect));
+        let mut cam = Camera2D::from_display_rect(cam_rect); cam.zoom.y = -cam.zoom.y; set_camera(&cam);
 
         // Cyber grid
         let grid = 80.0;
