@@ -1,17 +1,28 @@
 #[cfg(not(target_arch = "wasm32"))]
 use macroquad::audio::{load_sound_from_bytes, play_sound, PlaySoundParams, Sound};
+use macroquad::prelude::*;
 
 #[cfg(target_arch = "wasm32")]
+#[allow(dead_code)]
 mod wasm_audio {
+    #[derive(Clone, Copy)]
     pub struct Sound;
-    #[derive(Default)]
-    pub struct PlaySoundParams { pub looped: bool, pub volume: f32 }
-    pub async fn load_sound_from_bytes(_data: &[u8]) -> Result<Sound, ()> { Err(()) }
+
+    #[derive(Clone, Copy)]
+    pub struct PlaySoundParams {
+        pub looped: bool,
+        pub volume: f32,
+    }
+
+    pub async fn load_sound_from_bytes(_data: &[u8]) -> Result<Sound, ()> {
+        Ok(Sound)
+    }
+
     pub fn play_sound(_sound: &Sound, _params: PlaySoundParams) {}
 }
+
 #[cfg(target_arch = "wasm32")]
 use wasm_audio::{load_sound_from_bytes, play_sound, PlaySoundParams, Sound};
-use macroquad::prelude::*;
 
 const ARENA_RADIUS: f32 = 2800.0;
 const DEMO_MAX_WAVE: u32 = 8;
@@ -119,8 +130,9 @@ impl Default for MetaSave {
 
 impl MetaSave {
     fn save_path() -> &'static str {
-        if std::path::Path::new("/data/data/dev.vex.neoncore/files").exists() {
-            "/data/data/dev.vex.neoncore/files/save.dat"
+        if std::path::Path::new("/data/data/dev.vex.neon_core").exists() {
+            let _ = std::fs::create_dir_all("/data/data/dev.vex.neon_core/files");
+            "/data/data/dev.vex.neon_core/files/save.dat"
         } else {
             "neon_core_save.dat"
         }
@@ -569,23 +581,31 @@ fn synth_wav(freq_start: f32, freq_end: f32, duration: f32, volume: f32, square:
         } else {
             (phase * std::f32::consts::TAU).sin()
         };
-        let env = (1.0 - t).powf(1.6) * volume;
-        let sample = (wave * env * 32767.0).clamp(-32767.0, 32767.0) as i16;
+        let env = (1.0_f32 - t).powf(1.6_f32) * volume;
+        let sample = (wave * env * 32767.0_f32).clamp(-32767.0_f32, 32767.0_f32) as i16;
         buf.extend_from_slice(&sample.to_le_bytes());
     }
     buf
 }
 
 impl SoundBank {
-    async fn new() -> Self {
+    fn empty() -> Self {
         Self {
-            shoot: load_sound_from_bytes(&synth_wav(460.0, 110.0, 0.07, 0.22, true)).await.ok(),
-            hit: load_sound_from_bytes(&synth_wav(190.0, 55.0, 0.05, 0.25, false)).await.ok(),
-            boom: load_sound_from_bytes(&synth_wav(135.0, 24.0, 0.24, 0.42, true)).await.ok(),
-            dash: load_sound_from_bytes(&synth_wav(170.0, 540.0, 0.14, 0.30, false)).await.ok(),
-            lvlup: load_sound_from_bytes(&synth_wav(330.0, 880.0, 0.28, 0.32, false)).await.ok(),
+            shoot: None,
+            hit: None,
+            boom: None,
+            dash: None,
+            lvlup: None,
             shoot_cd: 0.0,
         }
+    }
+
+    async fn load_all(&mut self) {
+        self.shoot = load_sound_from_bytes(&synth_wav(460.0, 110.0, 0.07, 0.22, true)).await.ok();
+        self.hit = load_sound_from_bytes(&synth_wav(190.0, 55.0, 0.05, 0.25, false)).await.ok();
+        self.boom = load_sound_from_bytes(&synth_wav(135.0, 24.0, 0.24, 0.42, true)).await.ok();
+        self.dash = load_sound_from_bytes(&synth_wav(170.0, 540.0, 0.14, 0.30, false)).await.ok();
+        self.lvlup = load_sound_from_bytes(&synth_wav(330.0, 880.0, 0.28, 0.32, false)).await.ok();
     }
 
     fn play(&self, snd: &Option<Sound>, enabled: bool, vol: f32) {
@@ -1799,18 +1819,18 @@ impl Game {
                 }
             }
 
-            let mut shard = match kind {
+            let mut shard: u32 = match kind {
                 3 => 14,
                 6 => 5,
                 2 | 4 | 5 => 3,
                 _ => if rand::gen_range(0, 100) < 32 { 1 } else { 0 },
             };
-            let mut xp = match kind {
-                3 => 55.0,
-                6 => 24.0,
-                2 => 16.0,
-                4 | 5 => 14.0,
-                _ => 6.0,
+            let mut xp: f32 = match kind {
+                3 => 55.0_f32,
+                6 => 24.0_f32,
+                2 => 16.0_f32,
+                4 | 5 => 14.0_f32,
+                _ => 6.0_f32,
             };
             if elite {
                 shard = (shard * 3).max(3);
@@ -2749,16 +2769,17 @@ fn ui_button(rect: Rect, label: &str, sub: Option<&str>, border: Color) -> bool 
 
 fn window_conf() -> Conf {
     Conf {
-        window_title: "NEON CORE [RUST]".to_owned(),
+        window_title: "NEON CORE".to_owned(),
         high_dpi: true,
+        fullscreen: true,
         ..Default::default()
     }
 }
 
 #[macroquad::main(window_conf)]
 async fn main() {
-    let sounds = SoundBank::new().await;
-    let mut game = Game::new(sounds);
+    let mut game = Game::new(SoundBank::empty());
+    let mut audio_initialized = false;
 
     let cyan = Color::from_rgba(5, 217, 232, 255);
     let pink = Color::from_rgba(255, 42, 109, 255);
@@ -2767,11 +2788,25 @@ async fn main() {
     let slate = Color::from_rgba(72, 100, 138, 255);
 
     loop {
-        let dt = get_frame_time().min(0.05);
-        clear_background(Color::from_rgba(4, 6, 11, 255));
-
         let sw = screen_width();
         let sh = screen_height();
+        if !sw.is_finite() || !sh.is_finite() || sw < 16.0 || sh < 16.0 {
+            if game.state == ScreenState::Playing {
+                game.left_stick = Stick::new();
+                game.right_stick = Stick::new();
+            }
+            next_frame().await;
+            continue;
+        }
+
+        if !audio_initialized {
+            audio_initialized = true;
+            game.sounds.load_all().await;
+        }
+
+        let raw_dt = get_frame_time();
+        let dt = if raw_dt.is_finite() { raw_dt.clamp(0.0, 0.05) } else { 0.0 };
+        clear_background(Color::from_rgba(4, 6, 11, 255));
 
         match game.state {
             ScreenState::Menu => {
@@ -2948,7 +2983,9 @@ async fn main() {
                 }
             }
             ScreenState::Playing => {
-                game.update_playing(dt);
+                if dt > 0.0 {
+                    game.update_playing(dt);
+                }
                 game.render_world();
                 game.render_hud();
             }

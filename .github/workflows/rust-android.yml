@@ -44,25 +44,55 @@ jobs:
 
       - name: Build Native Android APK (Release)
         run: |
+          set -euo pipefail
           export NDK_HOME="$ANDROID_HOME/ndk/25.2.9519653"
           export ANDROID_NDK_HOME="$NDK_HOME"
-          BIN_DIR="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          TOOLCHAIN="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+          BIN_DIR="$TOOLCHAIN/bin"
           [ -e "$BIN_DIR/ld" ] || ln -sf "$BIN_DIR/ld.lld" "$BIN_DIR/ld"
 
           cargo quad-apk build --release
+
+          APK_PATH="target/android-artifacts/release/apk/neon_core.apk"
+          test -f "$APK_PATH"
+
+          BUILD_TOOLS_DIR="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          TMP_INSPECT="$(mktemp -d)"
+          unzip -q "$APK_PATH" "lib/arm64-v8a/*" -d "$TMP_INSPECT"
+          test -f "$TMP_INSPECT/lib/arm64-v8a/libneon_core.so"
+
+          NEEDED_LIBS="$("$BIN_DIR/llvm-readelf" -d "$TMP_INSPECT/lib/arm64-v8a/libneon_core.so" | grep '(NEEDED)' || true)"
+          echo "Needed shared libraries:"
+          echo "$NEEDED_LIBS"
+
+          if echo "$NEEDED_LIBS" | grep -q 'libc++_shared.so' && [ ! -f "$TMP_INSPECT/lib/arm64-v8a/libc++_shared.so" ]; then
+            echo "Bundling missing libc++_shared.so into lib/arm64-v8a/..."
+            mkdir -p "$TMP_INSPECT/repack/lib/arm64-v8a"
+            cp "$TOOLCHAIN/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" "$TMP_INSPECT/repack/lib/arm64-v8a/libc++_shared.so"
+            cp "$APK_PATH" "$TMP_INSPECT/unaligned.apk"
+            (cd "$TMP_INSPECT/repack" && zip -u "$TMP_INSPECT/unaligned.apk" "lib/arm64-v8a/libc++_shared.so")
+            "$BUILD_TOOLS_DIR/zipalign" -f -v 4 "$TMP_INSPECT/unaligned.apk" "$APK_PATH"
+            "$BUILD_TOOLS_DIR/apksigner" sign --ks "$HOME/.android/debug.keystore" --ks-pass pass:android "$APK_PATH"
+          fi
+
+          echo "=== Verifying APK Badging & Signature ==="
+          "$BUILD_TOOLS_DIR/aapt2" dump badging "$APK_PATH" | grep -E "package:|sdkVersion:|targetSdkVersion:|application-icon|launchable-activity:"
+          "$BUILD_TOOLS_DIR/apksigner" verify --verbose "$APK_PATH"
+          rm -rf "$TMP_INSPECT"
 
       - name: Upload Native Android APK
         uses: actions/upload-artifact@v7
         with:
           name: neon-core-rust-android-apk
-          path: target/android-artifacts/release/apk/*.apk
+          path: target/android-artifacts/release/apk/neon_core.apk
           if-no-files-found: error
 
       - name: Build WASM Web Demo (itch.io)
         run: |
+          set -euo pipefail
           cargo build --release --target wasm32-unknown-unknown --features demo
           mkdir -p web-demo
-          cp target/wasm32-unknown-unknown/release/neon-core.wasm web-demo/
+          cp target/wasm32-unknown-unknown/release/neon_core.wasm web-demo/
           curl -sL https://not-fl3.github.io/miniquad-samples/mq_js_bundle.js -o web-demo/mq_js_bundle.js
           cat << 'IDX' > web-demo/index.html
           <!doctype html>
@@ -76,7 +106,7 @@ jobs:
           <body>
             <canvas id="glcanvas" tabindex="1"></canvas>
             <script src="mq_js_bundle.js"></script>
-            <script>load("neon-core.wasm");</script>
+            <script>load("neon_core.wasm");</script>
           </body>
           </html>
           IDX
